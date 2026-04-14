@@ -1,0 +1,6 @@
+insightface==0.7.3
+onnxruntime
+opencv-python
+numpy
+scipy
+tqdm
