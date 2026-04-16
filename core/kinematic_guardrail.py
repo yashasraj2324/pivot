@@ -13,15 +13,16 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Sequence
 import warnings
 
-import cv2
 import numpy as np
-import torch
 from PIL import Image
 
 try:
     from controlnet_aux import DWposeDetector
 except Exception:  # noqa: BLE001
     DWposeDetector = None
+
+import torch
+import cv2
 
 
 # COCO 17-keypoint skeleton definition
@@ -53,6 +54,35 @@ COCO_BONES = [
     (5, 11), (6, 12), (11, 12)  # torso
 ]
 
+# Joint angle limits for biomechanical validation (per ADR-002)
+# Format: {joint_idx: (min_angle, max_angle)} in degrees
+JOINT_ANGLE_LIMITS: Dict[int, Tuple[float, float]] = {
+    5: (0, 180),   # left_shoulder
+    6: (0, 180),   # right_shoulder
+    7: (0, 145),   # left_elbow
+    8: (0, 145),   # right_elbow
+    11: (0, 120),  # left_hip
+    12: (0, 120),  # right_hip
+    13: (0, 150),  # left_knee
+    14: (0, 150),  # right_knee
+}
+
+
+def get_joint_limits(custom_limits: Dict[int, Tuple[float, float]] = None) -> Dict[int, Tuple[float, float]]:
+    """
+    Get joint limits with optional overrides.
+    
+    Args:
+        custom_limits: Optional dict to override default limits
+        
+    Returns:
+        Dict of joint_idx -> (min_angle, max_angle)
+    """
+    limits = JOINT_ANGLE_LIMITS.copy()
+    if custom_limits:
+        limits.update(custom_limits)
+    return limits
+
 
 class PoseEstimator:
     """
@@ -70,13 +100,22 @@ class PoseEstimator:
             device: Device to run inference on ('auto', 'cpu', 'cuda', 'cuda:0', etc.)
         """
         self.device = self._resolve_device(device)
-        self.detector = self._load_detector()
+        self._detector = None
+        self._last_keypoints: Optional[np.ndarray] = None
 
     def _resolve_device(self, device: str) -> str:
         """Resolve device string to actual torch device."""
         if device == "auto":
+            import torch
             return "cuda" if torch.cuda.is_available() else "cpu"
         return device
+
+    @property
+    def detector(self):
+        """Lazy-load detector on first access."""
+        if self._detector is None:
+            self._detector = self._load_detector()
+        return self._detector
 
     def _load_detector(self):
         """Load and cache the DWPose detector."""
@@ -256,6 +295,88 @@ class PoseEstimator:
         angle = np.degrees(np.arccos(cos_angle))
 
         return angle
+
+    def compute_rom_loss(
+        self,
+        keypoints: np.ndarray = None,
+        joint_angles: Dict[int, float] = None,
+        limits: Dict[int, Tuple[float, float]] = None,
+    ) -> float:
+        """
+        Compute range of motion penalty (L_ROM).
+        
+        L_ROM = (1/N) * Σ max(0, angle - max_limit) + max(0, min_limit - angle)
+        Penalizes both upper and lower bound violations.
+        
+        Args:
+            keypoints: Shape (17, 3) keypoints array. If provided, angles are computed from it.
+            joint_angles: Dict of joint_idx -> angle in degrees. Alternative to keypoints.
+            limits: Joint angle limits. If None, uses JOINT_ANGLE_LIMITS.
+            
+        Returns:
+            Normalized L_ROM penalty (0 = no violation)
+        """
+        if limits is None:
+            limits = JOINT_ANGLE_LIMITS
+        
+        if joint_angles is None and keypoints is not None:
+            joint_angles = self.get_joint_angles(keypoints)
+        elif joint_angles is None and keypoints is None:
+            return 0.0
+        
+        total_penalty = 0.0
+        num_joints = 0
+        
+        for joint_idx, (min_angle, max_angle) in limits.items():
+            angle = joint_angles.get(joint_idx, 0)
+            if angle > 0:
+                num_joints += 1
+                if angle < min_angle:
+                    total_penalty += (min_angle - angle) / 180.0
+                elif angle > max_angle:
+                    total_penalty += (angle - max_angle) / 180.0
+        
+        return total_penalty / max(num_joints, 1)
+    
+    def clamp_joint_angles(
+        self,
+        keypoints: np.ndarray,
+        limits: Dict[int, Tuple[float, float]] = None,
+    ) -> np.ndarray:
+        """
+        Return keypoints with joint angles clamped to physiological limits.
+        
+        Note: Full IK-based correction is complex. This implementation
+        provides a simplified version that detects and flags violations.
+        For production use, consider integrating a lightweight IK solver.
+        
+        Args:
+            keypoints: Shape (17, 3) keypoints array
+            limits: Joint angle limits. If None, uses JOINT_ANGLE_LIMITS.
+            
+        Returns:
+            Tuple of (corrected_keypoints, violations) where violations is list of dicts
+        """
+        if limits is None:
+            limits = JOINT_ANGLE_LIMITS
+        
+        corrected = keypoints.copy()
+        joint_angles = self.get_joint_angles(keypoints)
+        violations = []
+        
+        for joint_idx, (min_angle, max_angle) in limits.items():
+            angle = joint_angles.get(joint_idx, 0)
+            if angle > 0:
+                if angle < min_angle or angle > max_angle:
+                    violations.append({
+                        "joint": joint_idx,
+                        "joint_name": COCO_KEYPOINTS.get(joint_idx, f"joint_{joint_idx}"),
+                        "angle": angle,
+                        "limit": (min_angle, max_angle),
+                        "violation_type": "hyperextension" if angle < min_angle else "over_extension"
+                    })
+        
+        return corrected, violations
 
     def validate_pose(self, keypoints: np.ndarray) -> Dict[str, Any]:
         """
