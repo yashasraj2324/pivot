@@ -10,15 +10,18 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Sequence
 import warnings
 
 import cv2
 import numpy as np
 import torch
 from PIL import Image
-from controlnet_aux import DWposeDetector
-from diffusers import ControlNetModel
+
+try:
+    from controlnet_aux import DWposeDetector
+except Exception:  # noqa: BLE001
+    DWposeDetector = None
 
 
 # COCO 17-keypoint skeleton definition
@@ -80,6 +83,8 @@ class PoseEstimator:
         try:
             # Try to use DWPoseDetector from controlnet_aux
             try:
+                if DWposeDetector is None:
+                    raise ImportError("controlnet_aux.DWposeDetector is unavailable")
                 detector = DWposeDetector()
                 detector.to(self.device)
                 return detector
@@ -330,3 +335,102 @@ def estimate_pose_from_image(
     """
     estimator = get_pose_estimator(device=device)
     return estimator.estimate_pose(image_path)
+
+
+def compute_bone_lengths(
+    pose_keypoints: np.ndarray,
+    bone_pairs: Sequence[tuple[int, int]] | None = None,
+) -> np.ndarray:
+    """
+    Compute per-frame bone lengths from pose keypoints.
+
+    Parameters
+    ----------
+    pose_keypoints:
+        Pose tensor shaped ``[B, T, K, 2]`` or ``[T, K, 2]``.
+    bone_pairs:
+        Skeletal keypoint index pairs. Defaults to ``COCO_BONES``.
+
+    Returns
+    -------
+    np.ndarray
+        Bone lengths with shape ``[B, T, P]``, where ``P`` is number of pairs.
+    """
+    keypoints = _coerce_pose_keypoints(pose_keypoints)
+    pairs = tuple(bone_pairs) if bone_pairs is not None else tuple(COCO_BONES)
+    _validate_bone_pairs(pairs, num_keypoints=keypoints.shape[2])
+
+    start_indices = np.asarray([a for a, _ in pairs], dtype=np.int64)
+    end_indices = np.asarray([b for _, b in pairs], dtype=np.int64)
+
+    starts = keypoints[:, :, start_indices, :]
+    ends = keypoints[:, :, end_indices, :]
+    vectors = ends - starts
+
+    return np.linalg.norm(vectors, axis=-1).astype(np.float32)
+
+
+def bone_length_invariance_loss(
+    pose_keypoints: np.ndarray,
+    bone_pairs: Sequence[tuple[int, int]] | None = None,
+) -> tuple[np.ndarray, float]:
+    """
+    Compute L_bone invariance loss for consecutive frames.
+
+    L_bone = sum_{b,t,p} (d[b,t,p] - d[b,t-1,p])^2
+    where d is the per-frame bone length tensor.
+
+    Parameters
+    ----------
+    pose_keypoints:
+        Pose tensor shaped ``[B, T, K, 2]`` or ``[T, K, 2]``.
+    bone_pairs:
+        Skeletal keypoint index pairs. Defaults to ``COCO_BONES``.
+
+    Returns
+    -------
+    tuple[np.ndarray, float]
+        ``(bone_lengths, bone_loss)``.
+    """
+    bone_lengths = compute_bone_lengths(pose_keypoints, bone_pairs=bone_pairs)
+
+    if bone_lengths.shape[1] < 2:
+        return bone_lengths, 0.0
+
+    delta = bone_lengths[:, 1:, :] - bone_lengths[:, :-1, :]
+    loss = float(np.sum(np.square(delta), dtype=np.float64))
+    return bone_lengths, loss
+
+
+def _coerce_pose_keypoints(pose_keypoints: np.ndarray) -> np.ndarray:
+    """Normalize pose keypoints to ``[B, T, K, 2]`` float32."""
+    points = np.asarray(pose_keypoints, dtype=np.float32)
+
+    if points.ndim == 3:
+        points = points[None, ...]
+
+    if points.ndim != 4:
+        raise ValueError("pose_keypoints must have shape [B, T, K, 2] or [T, K, 2].")
+
+    if points.shape[-1] < 2:
+        raise ValueError("pose_keypoints last dimension must include x,y coordinates.")
+
+    return points[..., :2].astype(np.float32)
+
+
+def _validate_bone_pairs(
+    bone_pairs: Sequence[tuple[int, int]],
+    *,
+    num_keypoints: int,
+) -> None:
+    """Validate bone pair indices against keypoint dimension."""
+    if not bone_pairs:
+        raise ValueError("bone_pairs cannot be empty.")
+
+    for start, end in bone_pairs:
+        if start < 0 or end < 0:
+            raise ValueError("bone pair indices must be non-negative.")
+        if start >= num_keypoints or end >= num_keypoints:
+            raise ValueError(
+                f"bone pair ({start}, {end}) out of range for {num_keypoints} keypoints."
+            )
