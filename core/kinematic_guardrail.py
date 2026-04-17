@@ -555,3 +555,86 @@ def _validate_bone_pairs(
             raise ValueError(
                 f"bone pair ({start}, {end}) out of range for {num_keypoints} keypoints."
             )
+
+
+V_MAX_DEFAULT = 2.0
+
+
+def compute_velocity_loss(
+    pose_keypoints: np.ndarray,
+    v_max: float = V_MAX_DEFAULT,
+) -> tuple[np.ndarray, float]:
+    """
+    Compute temporal velocity loss (L_velocity) for consecutive frames.
+
+    L_velocity = sum_{t,k} max(0, ||(p_t[k] - p_{t-1}[k])|| - v_max)^2
+    Penalizes velocities exceeding v_max threshold.
+
+    Parameters
+    ----------
+    pose_keypoints:
+        Pose tensor shaped ``[B, T, K, 2]`` or ``[T, K, 2]``.
+    v_max:
+        Maximum allowed velocity in units/frame. Default 2.0.
+
+    Returns
+    -------
+    tuple[np.ndarray, float]
+        ``(velocities, velocity_loss)`` where velocities shape is [B, T-1, K]
+    """
+    keypoints = _coerce_pose_keypoints(pose_keypoints)
+
+    if keypoints.shape[1] < 2:
+        return np.zeros((keypoints.shape[0], keypoints.shape[1] - 1, keypoints.shape[2])), 0.0
+
+    current = keypoints[:, 1:, :, :]
+    previous = keypoints[:, :-1, :, :]
+    displacements = current - previous
+    velocities = np.linalg.norm(displacements, axis=-1)
+
+    exceedances = np.maximum(0.0, velocities - v_max)
+    loss = float(np.sum(np.square(exceedances)))
+
+    return velocities, loss
+
+
+def compute_l_physics(
+    pose_keypoints: np.ndarray,
+    bone_pairs: Sequence[tuple[int, int]] | None = None,
+    v_max: float = V_MAX_DEFAULT,
+    bone_weight: float = 1.0,
+    velocity_weight: float = 1.0,
+) -> dict[str, float]:
+    """
+    Compute composite L_physics loss combining bone length invariance and velocity limits.
+
+    L_physics = bone_weight * L_bone + velocity_weight * L_velocity
+
+    Parameters
+    ----------
+    pose_keypoints:
+        Pose tensor shaped ``[B, T, K, 2]`` or ``[T, K, 2]``.
+    bone_pairs:
+        Skeletal keypoint index pairs. Defaults to ``COCO_BONES``.
+    v_max:
+        Maximum allowed velocity in units/frame. Default 2.0.
+    bone_weight:
+        Weight for bone length loss component.
+    velocity_weight:
+        Weight for velocity loss component.
+
+    Returns
+    -------
+    dict[str, float]
+        Dict with 'bone_loss', 'velocity_loss', 'total_loss' keys.
+    """
+    _, bone_loss = bone_length_invariance_loss(pose_keypoints, bone_pairs=bone_pairs)
+    _, velocity_loss = compute_velocity_loss(pose_keypoints, v_max=v_max)
+
+    total_loss = bone_weight * bone_loss + velocity_weight * velocity_loss
+
+    return {
+        "bone_loss": bone_loss,
+        "velocity_loss": velocity_loss,
+        "total_loss": total_loss,
+    }

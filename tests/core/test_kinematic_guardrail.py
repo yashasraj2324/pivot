@@ -10,9 +10,106 @@ import pytest
 
 from core.kinematic_guardrail import (
     COCO_BONES,
+    V_MAX_DEFAULT,
     bone_length_invariance_loss,
     compute_bone_lengths,
+    compute_velocity_loss,
+    compute_l_physics,
 )
+
+
+class TestVelocityLoss:
+    @pytest.fixture
+    def base_pose(self):
+        """Create base pose for velocity tests."""
+        xs = np.linspace(0.0, 1.0, 17, dtype=np.float32)
+        ys = np.linspace(1.0, 2.0, 17, dtype=np.float32)
+        return np.stack([xs, ys], axis=-1)
+
+    def test_compute_velocity_loss_zero_for_stationary(self, base_pose):
+        """L_velocity should be ~0 for stationary keypoints."""
+        pose = np.stack([base_pose, base_pose, base_pose], axis=0)[None, ...]
+        _, loss = compute_velocity_loss(pose, v_max=2.0)
+        assert loss == pytest.approx(0.0, abs=1e-7)
+
+    def test_compute_velocity_loss_zero_below_v_max(self, base_pose):
+        """L_velocity should be ~0 when velocities below v_max."""
+        frame0 = base_pose
+        frame1 = base_pose + np.array([0.5, 0.5], dtype=np.float32)
+        frame2 = base_pose + np.array([1.0, 1.0], dtype=np.float32)
+        pose = np.stack([frame0, frame1, frame2], axis=0)[None, ...]
+        _, loss = compute_velocity_loss(pose, v_max=2.0)
+        assert loss == pytest.approx(0.0, abs=1e-7)
+
+    def test_compute_velocity_loss_penalizes_exceedance(self, base_pose):
+        """L_velocity should penalize velocities exceeding v_max."""
+        frame0 = base_pose
+        frame1 = base_pose + np.array([3.0, 0.0], dtype=np.float32)  # velocity = 3.0 > v_max
+        pose = np.stack([frame0, frame1], axis=0)[None, ...]
+        _, loss = compute_velocity_loss(pose, v_max=2.0)
+        assert loss > 0.0
+
+    def test_compute_velocity_loss_single_frame_returns_zero(self, base_pose):
+        """L_velocity should be 0 when only one frame."""
+        pose = base_pose[None, None, ...]
+        _, loss = compute_velocity_loss(pose, v_max=2.0)
+        assert loss == 0.0
+
+    def test_compute_velocity_loss_custom_v_max(self, base_pose):
+        """compute_velocity_loss should accept custom v_max."""
+        frame0 = base_pose
+        frame1 = base_pose + np.array([2.5, 0.0], dtype=np.float32)  # velocity = 2.5
+        pose = np.stack([frame0, frame1], axis=0)[None, ...]
+        _, loss_low = compute_velocity_loss(pose, v_max=2.0)  # exceeds
+        _, loss_high = compute_velocity_loss(pose, v_max=3.0)  # within
+        assert loss_low > 0.0
+        assert loss_high == pytest.approx(0.0, abs=1e-7)
+
+    def test_compute_velocity_loss_returns_velocity_array(self, base_pose):
+        """compute_velocity_loss should return velocity magnitudes."""
+        frame0 = base_pose
+        frame1 = base_pose + np.array([1.0, 0.0], dtype=np.float32)
+        frame2 = base_pose + np.array([2.0, 0.0], dtype=np.float32)
+        pose = np.stack([frame0, frame1, frame2], axis=0)[None, ...]
+        velocities, _ = compute_velocity_loss(pose, v_max=2.0)
+        assert velocities.shape == (1, 2, 17)  # [B, T-1, K]
+
+    def test_compute_velocity_loss_accepts_unbatched(self, base_pose):
+        """compute_velocity_loss should accept unbatched [T, K, 2] input."""
+        pose = np.stack([base_pose, base_pose + 0.5], axis=0)
+        velocities, loss = compute_velocity_loss(pose, v_max=2.0)
+        assert velocities.shape == (1, 1, 17)  # [B, T-1, K]
+        assert isinstance(loss, float)
+
+
+class TestLPhysics:
+    @pytest.fixture
+    def base_pose(self):
+        """Create base pose for L_physics tests."""
+        xs = np.linspace(0.0, 1.0, 17, dtype=np.float32)
+        ys = np.linspace(1.0, 2.0, 17, dtype=np.float32)
+        return np.stack([xs, ys], axis=-1)
+
+    def test_compute_l_physics_returns_dict(self, base_pose):
+        """compute_l_physics should return dict with expected keys."""
+        pose = np.stack([base_pose, base_pose + 0.5], axis=0)[None, ...]
+        result = compute_l_physics(pose)
+        assert "bone_loss" in result
+        assert "velocity_loss" in result
+        assert "total_loss" in result
+
+    def test_compute_l_physics_combines_weights(self, base_pose):
+        """compute_l_physics should combine losses with weights."""
+        frame0 = base_pose
+        frame1 = base_pose + np.array([3.0, 0.0], dtype=np.float32)  # velocity violation
+        pose = np.stack([frame0, frame1], axis=0)[None, ...]
+        result_default = compute_l_physics(pose, bone_weight=1.0, velocity_weight=1.0)
+        result_custom = compute_l_physics(pose, bone_weight=0.5, velocity_weight=2.0)
+        assert result_default["total_loss"] != result_custom["total_loss"]
+
+    def test_compute_v_max_default(self):
+        """V_MAX_DEFAULT should be 2.0."""
+        assert V_MAX_DEFAULT == 2.0
 
 
 def _make_base_pose(num_keypoints: int = 17) -> np.ndarray:
