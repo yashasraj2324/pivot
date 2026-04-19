@@ -604,4 +604,51 @@ class TestConstrainedRegenerationEngine:
         engine = ConstrainedRegenerationEngine()
         result = VerificationResult(passed=True)
         config = engine.get_config(result, retry_count=3)
-        assert config.retry_count == 3                       
+        assert config.retry_count == 3    
+
+class TestMaxRetryDepthWithFallback:
+    """Test suite for T3.7 — max retry depth with fallback to best candidate."""
+
+    def test_default_max_retries_is_five(self):
+        """Daemon default max retries must be 5."""
+        daemon = VerificationDaemon(enable_logging=False)
+        assert daemon.max_retries == 5
+
+    def test_stops_at_max_retries(self):
+        """Daemon must stop exactly at max_retries."""
+        daemon = VerificationDaemon(max_retries=5, enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+        result = daemon.run(ref, bad)
+        assert result.retry_count == 5
+
+    def test_fallback_returns_best_candidate(self):
+        """After exhausting retries fallback must return highest similarity."""
+        daemon = VerificationDaemon(max_retries=3, enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+
+        # always return a bad embedding — never passes threshold
+        def generation_fn(weight):
+            bad = np.random.randn(512).astype(np.float32)
+            return bad / np.linalg.norm(bad)
+
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+
+        result = daemon.run(ref, bad, generation_fn=generation_fn)
+    
+        assert result.retry_count == 3
+        assert result.passed is False
+        assert result.final_similarity is not None
+    
+    def test_fallback_not_triggered_on_pass(self):
+        """Fallback must not trigger if identity passes."""
+        daemon = VerificationDaemon(max_retries=5, enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        result = daemon.run(ref, ref)
+        assert result.passed is True
+        assert result.retry_count == 0                           

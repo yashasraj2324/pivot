@@ -232,6 +232,10 @@ class VerificationDaemon:
         """
         Run verification with correction loop.
 
+        Per ADR-003:
+        - Max 5 retries per frame
+        - On exhaustion, falls back to highest-scoring candidate
+
         Args:
             reference_embedding: Reference ArcFace embedding (512-d)
             generated_embedding: Initial generated face embedding
@@ -243,12 +247,14 @@ class VerificationDaemon:
         """
         retry_count = 0
         latent_rewind_count = 0
+        candidates: list[tuple[float, IdentityGateResult]] = []
 
         kinematic_result = None
         if pose_keypoints is not None and self.enable_kinematic:
             kinematic_result = self.verify_kinematic(pose_keypoints)
-            if not kinematic_result.passed and self.enable_logging:
-                print(f"[VerificationDaemon] Kinematic check failed, halting early")
+            if not kinematic_result.passed:
+                if self.enable_logging:
+                    print(f"[VerificationDaemon] Kinematic check failed, halting early")
                 return VerificationResult(
                     passed=False,
                     identity_result=None,
@@ -258,6 +264,7 @@ class VerificationDaemon:
                 )
 
         identity_result = self.verify_identity(reference_embedding, generated_embedding)
+        candidates.append((identity_result.similarity_score, identity_result))
 
         if self.enable_logging:
             print(f"[VerificationDaemon] Initial check: identity={'PASS' if identity_result.passed else 'FAIL'}")
@@ -283,9 +290,17 @@ class VerificationDaemon:
                 generated_embedding = generation_fn(new_weight)
 
             identity_result = self.verify_identity(reference_embedding, generated_embedding)
+            candidates.append((identity_result.similarity_score, identity_result))
 
             if self.enable_logging:
                 print(f"[VerificationDaemon] Retry {retry_count} result: {'PASS' if identity_result.passed else 'FAIL'}")
+
+        if not identity_result.passed and candidates:
+            best_score, best_result = max(candidates, key=lambda x: x[0])
+            if self.enable_logging:
+                print(f"[VerificationDaemon] All retries exhausted. "
+                      f"Falling back to best candidate: similarity={best_score:.4f}")
+            identity_result = best_result
 
         return VerificationResult(
             passed=identity_result.passed,
