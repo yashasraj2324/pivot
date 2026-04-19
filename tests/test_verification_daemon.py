@@ -651,4 +651,65 @@ class TestMaxRetryDepthWithFallback:
         ref = ref / np.linalg.norm(ref)
         result = daemon.run(ref, ref)
         assert result.passed is True
-        assert result.retry_count == 0                           
+        assert result.retry_count == 0      
+        
+class TestT41IdentityRouterToDaemonIntegration:
+    """T4.1: Identity Router connected to Verification Daemon."""
+
+    def test_imports_work_together(self):
+        """Identity Router and Daemon must be importable together."""
+        from core.identity_router import cosine_similarity, extract_arcface_embedding
+        from core.verification_daemon import VerificationDaemon
+        assert callable(cosine_similarity)
+        assert callable(extract_arcface_embedding)
+        assert VerificationDaemon is not None
+
+    def test_daemon_uses_cosine_gate(self):
+        """Daemon identity gate must be CosineSimilarityGate instance."""
+        from core.cosine_similarity_gate import CosineSimilarityGate
+        daemon = VerificationDaemon(enable_logging=False)
+        assert isinstance(daemon.identity_gate, CosineSimilarityGate)
+
+    def test_full_identity_verification_pass(self):
+        """Matching embeddings must pass through full pipeline."""
+        daemon = VerificationDaemon(enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        result = daemon.verify_single_pass(ref, ref)
+        assert result.passed is True
+        assert result.final_similarity >= 0.90
+
+    def test_full_identity_verification_fail(self):
+        """Non-matching embeddings must fail through full pipeline."""
+        daemon = VerificationDaemon(enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+        result = daemon.verify_single_pass(ref, bad)
+        assert result.passed is False
+
+    def test_correction_loop_with_identity_router(self):
+        """Correction loop must recover using identity router embeddings."""
+        daemon = VerificationDaemon(max_retries=3, enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+
+        def generation_fn(weight):
+            return ref
+
+        result = daemon.run(ref, bad, generation_fn=generation_fn)
+        assert result.passed is True
+        assert result.retry_count == 1
+
+    def test_cosine_similarity_from_identity_router(self):
+        """cosine_similarity from identity_router must match gate output."""
+        from core.identity_router import cosine_similarity
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        daemon = VerificationDaemon(enable_logging=False)
+        direct_score = cosine_similarity(ref, ref)
+        gate_score = daemon.get_identity_similarity(ref, ref)
+        assert abs(direct_score - gate_score) < 1e-5                             
