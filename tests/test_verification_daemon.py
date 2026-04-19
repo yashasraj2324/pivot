@@ -779,4 +779,99 @@ class TestT42KinematicGuardrailToDaemonIntegration:
         assert hasattr(result, 'bone_loss')
         assert hasattr(result, 'velocity_loss')
         assert hasattr(result, 'total_loss')
-        assert hasattr(result, 'max_velocity')                                  
+        assert hasattr(result, 'max_velocity')   
+        
+class TestT43EndToEndPipelineIntegration:
+    """T4.3: End-to-end pipeline integration — Identity Router + Kinematic Guardrail + Daemon."""
+
+    def test_all_components_importable(self):
+        """All three components must be importable together."""
+        from core.identity_router import cosine_similarity, extract_arcface_embedding
+        from core.kinematic_guardrail import compute_l_physics, compute_velocity_loss
+        from core.verification_daemon import VerificationDaemon, create_verification_daemon
+        assert all([
+            callable(cosine_similarity),
+            callable(extract_arcface_embedding),
+            callable(compute_l_physics),
+            callable(compute_velocity_loss),
+            VerificationDaemon is not None,
+        ])
+
+    def test_single_pass_identity_and_kinematic_both_pass(self):
+        """Both identity and kinematic must pass in single pass."""
+        daemon = create_verification_daemon(enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+        pose[1] = 0.5  # within v_max
+
+        result = daemon.verify_single_pass(ref, ref, pose_keypoints=pose)
+
+        assert result.passed is True
+        assert result.identity_result is not None
+        assert result.identity_result.passed is True
+        assert result.kinematic_result is not None
+        assert result.kinematic_result.passed is True
+
+    def test_single_pass_identity_fails_kinematic_passes(self):
+        """Identity failure with kinematic pass."""
+        daemon = create_verification_daemon(enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+
+        result = daemon.verify_single_pass(ref, bad, pose_keypoints=pose)
+
+        assert result.passed is False
+        assert result.kinematic_result.passed is True
+        assert result.identity_result.passed is False
+
+    def test_single_pass_kinematic_fails_halts_identity(self):
+        """Kinematic failure must halt before identity check."""
+        daemon = create_verification_daemon(
+            kinematic_threshold=0.0,
+            enable_logging=False,
+        )
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+        pose[1] = 999.0
+
+        result = daemon.verify_single_pass(ref, ref, pose_keypoints=pose)
+
+        assert result.passed is False
+        assert result.kinematic_result.passed is False
+        assert result.identity_result is None
+
+    def test_full_pipeline_no_corrections(self):
+        """Full pipeline run without corrections — matching embeddings, valid pose."""
+        daemon = create_verification_daemon(enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+
+        result = daemon.run(ref, ref, pose_keypoints=pose)
+
+        assert result.passed is True
+        assert result.retry_count == 0
+        assert result.kinematic_result.passed is True
+        assert result.identity_result.passed is True
+
+    def test_pipeline_result_contains_all_fields(self):
+        """Result must contain all expected fields."""
+        daemon = create_verification_daemon(enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+
+        result = daemon.run(ref, ref, pose_keypoints=pose)
+
+        assert result.passed is not None
+        assert result.identity_result is not None
+        assert result.kinematic_result is not None
+        assert result.retry_count == 0
+        assert result.max_retries == 5
+        assert result.final_similarity is not None
+        assert result.latent_rewind_count == 0                                       
