@@ -712,4 +712,71 @@ class TestT41IdentityRouterToDaemonIntegration:
         daemon = VerificationDaemon(enable_logging=False)
         direct_score = cosine_similarity(ref, ref)
         gate_score = daemon.get_identity_similarity(ref, ref)
-        assert abs(direct_score - gate_score) < 1e-5                             
+        assert abs(direct_score - gate_score) < 1e-5   
+        
+class TestT42KinematicGuardrailToDaemonIntegration:
+    """T4.2: Kinematic Guardrail connected to Verification Daemon."""
+
+    def test_imports_work_together(self):
+        """Kinematic Guardrail and Daemon must be importable together."""
+        from core.kinematic_guardrail import compute_l_physics, compute_velocity_loss
+        from core.verification_daemon import VerificationDaemon
+        assert callable(compute_l_physics)
+        assert callable(compute_velocity_loss)
+        assert VerificationDaemon is not None
+
+    def test_verify_kinematic_pass(self):
+        """Static pose should pass kinematic verification."""
+        daemon = VerificationDaemon(enable_logging=False)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+        pose[1] = 1.0  # small movement within v_max
+        result = daemon.verify_kinematic(pose)
+        assert result.passed is True
+        assert result.total_loss >= 0.0
+
+    def test_verify_kinematic_fail_on_high_velocity(self):
+        """Large displacement should fail kinematic verification."""
+        daemon = VerificationDaemon(
+            kinematic_threshold=0.0,
+            enable_logging=False,
+        )
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+        pose[1] = 999.0  # massive jump
+        result = daemon.verify_kinematic(pose)
+        assert result.passed is False
+        assert result.total_loss > 0.0
+
+    def test_kinematic_halt_before_identity(self):
+        """Kinematic failure must halt pipeline before identity check."""
+        daemon = VerificationDaemon(
+            kinematic_threshold=0.0,
+            enable_logging=False,
+        )
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+        pose[1] = 999.0
+        result = daemon.run(ref, ref, pose_keypoints=pose)
+        assert result.passed is False
+        assert result.kinematic_result is not None
+        assert result.identity_result is None
+
+    def test_kinematic_pass_proceeds_to_identity(self):
+        """Kinematic pass must allow identity check to proceed."""
+        daemon = VerificationDaemon(enable_logging=False)
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+        result = daemon.run(ref, ref, pose_keypoints=pose)
+        assert result.identity_result is not None
+        assert result.passed is True
+
+    def test_kinematic_result_contains_loss_components(self):
+        """KinematicResult must contain all loss components."""
+        daemon = VerificationDaemon(enable_logging=False)
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+        result = daemon.verify_kinematic(pose)
+        assert hasattr(result, 'bone_loss')
+        assert hasattr(result, 'velocity_loss')
+        assert hasattr(result, 'total_loss')
+        assert hasattr(result, 'max_velocity')                                  
