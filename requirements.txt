@@ -4,3 +4,9 @@ opencv-python
 numpy
 scipy
 tqdm
+torch
+torchvision
+diffusers
+transformers
+controlnet-aux
+pillow
