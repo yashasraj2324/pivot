@@ -247,3 +247,115 @@ class TestFactory:
         assert isinstance(daemon, VerificationDaemon)
         assert daemon.identity_gate.threshold == 0.85
         assert daemon.max_retries == 3
+
+class TestLatentStateManager:
+    """Test suite for LatentStateManager — T3.4."""
+
+    def test_push_and_depth(self):
+        """depth should increase with each push."""
+        from core.verification_daemon import LatentStateManager
+        manager = LatentStateManager(max_history=5)
+
+        assert manager.depth == 0
+        manager.push(np.zeros((4, 64, 64), dtype=np.float32))
+        assert manager.depth == 1
+        manager.push(np.ones((4, 64, 64), dtype=np.float32))
+        assert manager.depth == 2
+
+    def test_rewind_returns_previous_state(self):
+        """rewind should return t-1 latent and discard current."""
+        from core.verification_daemon import LatentStateManager
+        manager = LatentStateManager(max_history=5)
+
+        t0 = np.full((4, 64, 64), 0.0, dtype=np.float32)
+        t1 = np.full((4, 64, 64), 1.0, dtype=np.float32)
+
+        manager.push(t0)
+        manager.push(t1)
+
+        rewound = manager.rewind()
+
+        assert rewound is not None
+        assert np.allclose(rewound, t0)
+        assert manager.depth == 1
+
+    def test_rewind_empty_returns_none(self):
+        """rewind on empty manager should return None."""
+        from core.verification_daemon import LatentStateManager
+        manager = LatentStateManager(max_history=5)
+
+        assert manager.rewind() is None
+
+    def test_rewind_single_entry_returns_none(self):
+        """rewind with only one entry discards it and returns None."""
+        from core.verification_daemon import LatentStateManager
+        manager = LatentStateManager(max_history=5)
+
+        manager.push(np.zeros((4, 64, 64), dtype=np.float32))
+        result = manager.rewind()
+
+        assert result is None
+        assert manager.depth == 0
+
+    def test_max_history_evicts_oldest(self):
+        """History beyond max_history should evict oldest entries."""
+        from core.verification_daemon import LatentStateManager
+        manager = LatentStateManager(max_history=3)
+
+        for i in range(5):
+            manager.push(np.full((4,), float(i), dtype=np.float32))
+
+        assert manager.depth == 3
+
+    def test_current_does_not_modify_history(self):
+        """current() should not change depth."""
+        from core.verification_daemon import LatentStateManager
+        manager = LatentStateManager(max_history=5)
+
+        manager.push(np.zeros((4,), dtype=np.float32))
+        _ = manager.current()
+
+        assert manager.depth == 1
+
+    def test_reset_clears_history(self):
+        """reset() should clear all stored states."""
+        from core.verification_daemon import LatentStateManager
+        manager = LatentStateManager(max_history=5)
+
+        manager.push(np.zeros((4,), dtype=np.float32))
+        manager.push(np.ones((4,), dtype=np.float32))
+        manager.reset()
+
+        assert manager.depth == 0
+        assert manager.current() is None
+
+    def test_as_rewind_fn_integrates_with_daemon(self):
+        """as_rewind_fn should wire manager into daemon correctly."""
+        from core.verification_daemon import LatentStateManager, VerificationDaemon
+
+        manager = LatentStateManager(max_history=5)
+        manager.push(np.zeros((4, 64, 64), dtype=np.float32))
+        manager.push(np.ones((4, 64, 64), dtype=np.float32))
+        manager.push(np.full((4, 64, 64), 2.0, dtype=np.float32))
+
+        daemon = VerificationDaemon(
+            max_retries=2,
+            enable_logging=False,
+            latent_rewind_fn=manager.as_rewind_fn(),
+        )
+
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+
+        result = daemon.run(ref, bad)
+
+        assert result.latent_rewind_count == 2
+
+    def test_invalid_max_history_raises(self):
+        """max_history < 1 should raise ValueError."""
+        from core.verification_daemon import LatentStateManager
+
+        with pytest.raises(ValueError):
+            LatentStateManager(max_history=0)        

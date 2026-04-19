@@ -382,3 +382,82 @@ def create_verification_daemon(
         kinematic_threshold=kinematic_threshold,
         enable_kinematic=enable_kinematic,
     )
+
+class LatentStateManager:
+    """
+    Tracks denoising latent states and enables rewind to t-1.
+
+    Per ADR-003: On constraint violation, the daemon rewinds the
+    denoising process to the last valid latent state (t-1).
+
+    Usage:
+        manager = LatentStateManager(max_history=5)
+        manager.push(latent_t0)   # after each denoising step
+        manager.push(latent_t1)
+        prev = manager.rewind()   # returns latent_t0, discards latent_t1
+    """
+
+    def __init__(self, max_history: int = 5):
+        """
+        Args:
+            max_history: Maximum number of latent states to keep.
+                         Older states beyond this are discarded.
+        """
+        if max_history < 1:
+            raise ValueError("max_history must be >= 1")
+        self.max_history = max_history
+        self._history: list[np.ndarray] = []
+
+    def push(self, latent: np.ndarray) -> None:
+        """
+        Store a latent state after a denoising step.
+
+        Args:
+            latent: Latent tensor from the current denoising step.
+        """
+        self._history.append(latent.copy())
+        if len(self._history) > self.max_history:
+            self._history.pop(0)
+
+    def rewind(self) -> Optional[np.ndarray]:
+        """
+        Rewind to the previous valid latent state (t-1).
+
+        Discards the most recent (failing) state and returns
+        the one before it. Returns None if no history exists.
+
+        Returns:
+            The t-1 latent state, or None if history is empty.
+        """
+        if not self._history:
+            return None
+        # discard the current (failing) state
+        self._history.pop()
+        if not self._history:
+            return None
+        return self._history[-1].copy()
+
+    def current(self) -> Optional[np.ndarray]:
+        """Return the most recent latent without modifying history."""
+        if not self._history:
+            return None
+        return self._history[-1].copy()
+
+    def reset(self) -> None:
+        """Clear all stored latent states."""
+        self._history.clear()
+
+    @property
+    def depth(self) -> int:
+        """Number of latent states currently stored."""
+        return len(self._history)
+
+    def as_rewind_fn(self) -> Callable[[], Optional[np.ndarray]]:
+        """
+        Return a callable compatible with VerificationDaemon.latent_rewind_fn.
+
+        This lets you pass the manager directly into the daemon:
+            manager = LatentStateManager()
+            daemon = VerificationDaemon(latent_rewind_fn=manager.as_rewind_fn())
+        """
+        return self.rewind
