@@ -54,6 +54,13 @@ COCO_BONES = [
     (5, 11), (6, 12), (11, 12)  # torso
 ]
 
+# Rigid body regions for topology preservation (T2.5)
+RIGID_REGIONS: Dict[str, Tuple[int, ...]] = {
+    "head": (0, 1, 2, 3, 4),
+    "torso": (5, 6, 11, 12),
+    "pelvis": (11, 12, 13, 14),
+}
+
 # Joint angle limits for biomechanical validation (per ADR-002)
 # Format: {joint_idx: (min_angle, max_angle)} in degrees
 JOINT_ANGLE_LIMITS: Dict[int, Tuple[float, float]] = {
@@ -65,6 +72,18 @@ JOINT_ANGLE_LIMITS: Dict[int, Tuple[float, float]] = {
     12: (0, 120),  # right_hip
     13: (0, 150),  # left_knee
     14: (0, 150),  # right_knee
+}
+
+# Joint triplets (a, b, c) where angle is computed at b from vectors ba and bc.
+JOINT_ANGLE_TRIPLETS: Dict[int, Tuple[int, int, int]] = {
+    5: (7, 5, 11),    # left_shoulder: elbow-shoulder-hip
+    6: (8, 6, 12),    # right_shoulder
+    7: (9, 7, 5),     # left_elbow: wrist-elbow-shoulder
+    8: (10, 8, 6),    # right_elbow
+    11: (13, 11, 5),  # left_hip: knee-hip-shoulder
+    12: (14, 12, 6),  # right_hip
+    13: (15, 13, 11), # left_knee: ankle-knee-hip
+    14: (16, 14, 12), # right_knee
 }
 
 
@@ -598,17 +617,249 @@ def compute_velocity_loss(
     return velocities, loss
 
 
+def compute_rom_loss(
+    pose_keypoints: np.ndarray,
+    joint_limits: Dict[int, Tuple[float, float]] | None = None,
+) -> tuple[np.ndarray, float]:
+    """
+    Compute biomechanical range-of-motion loss (L_ROM) over all frames.
+
+    For each tracked joint j and frame t, the penalty is:
+    max(0, min_j - angle_{t,j}) + max(0, angle_{t,j} - max_j)
+
+    The total loss is the sum of squared normalized penalties.
+
+    Parameters
+    ----------
+    pose_keypoints:
+        Pose tensor shaped ``[B, T, K, 2]`` or ``[T, K, 2]``.
+    joint_limits:
+        Optional joint limits map. Defaults to ``JOINT_ANGLE_LIMITS``.
+
+    Returns
+    -------
+    tuple[np.ndarray, float]
+        ``(joint_angles, rom_loss)`` where ``joint_angles`` has shape ``[B, T, J]``.
+    """
+    keypoints = _coerce_pose_keypoints(pose_keypoints)
+    limits = JOINT_ANGLE_LIMITS if joint_limits is None else dict(joint_limits)
+
+    if not limits:
+        raise ValueError("joint_limits cannot be empty.")
+
+    ordered_joints = sorted(limits.keys())
+    _validate_joint_indices(ordered_joints, num_keypoints=keypoints.shape[2])
+
+    joint_angles = _compute_joint_angles_batch(keypoints, ordered_joints)
+    penalties = np.zeros_like(joint_angles, dtype=np.float32)
+
+    for j, joint_idx in enumerate(ordered_joints):
+        min_angle, max_angle = limits[joint_idx]
+        lower = np.maximum(0.0, float(min_angle) - joint_angles[:, :, j])
+        upper = np.maximum(0.0, joint_angles[:, :, j] - float(max_angle))
+        penalties[:, :, j] = (lower + upper) / 180.0
+
+    rom_loss = float(np.sum(np.square(penalties), dtype=np.float64))
+    return joint_angles, rom_loss
+
+
+def _validate_joint_indices(joint_indices: Sequence[int], *, num_keypoints: int) -> None:
+    """Validate that requested joint indices are available and in range."""
+    for joint_idx in joint_indices:
+        if joint_idx < 0 or joint_idx >= num_keypoints:
+            raise ValueError(
+                f"joint index {joint_idx} out of range for {num_keypoints} keypoints."
+            )
+        if joint_idx not in JOINT_ANGLE_TRIPLETS:
+            raise ValueError(
+                f"joint index {joint_idx} has no configured angle triplet."
+            )
+
+
+def _compute_joint_angles_batch(
+    keypoints: np.ndarray,
+    ordered_joints: Sequence[int],
+) -> np.ndarray:
+    """Compute batched joint angles [B, T, J] in degrees."""
+    batch_size, num_frames, _, _ = keypoints.shape
+    angles = np.zeros((batch_size, num_frames, len(ordered_joints)), dtype=np.float32)
+
+    for j, joint_idx in enumerate(ordered_joints):
+        a_idx, b_idx, c_idx = JOINT_ANGLE_TRIPLETS[joint_idx]
+        a = keypoints[:, :, a_idx, :]
+        b = keypoints[:, :, b_idx, :]
+        c = keypoints[:, :, c_idx, :]
+        angles[:, :, j] = _angle_degrees(a, b, c)
+
+    return angles
+
+
+def _angle_degrees(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
+    """Compute angle ABC in degrees for batched 2D inputs shaped [B, T, 2]."""
+    ba = a - b
+    bc = c - b
+
+    dot = np.sum(ba * bc, axis=-1)
+    norm_ba = np.linalg.norm(ba, axis=-1)
+    norm_bc = np.linalg.norm(bc, axis=-1)
+    denom = np.maximum(norm_ba * norm_bc, 1e-8)
+
+    cos_theta = np.clip(dot / denom, -1.0, 1.0)
+    return np.degrees(np.arccos(cos_theta)).astype(np.float32)
+
+
+def compute_rigid_topology_loss(
+    pose_keypoints: np.ndarray,
+    regions: Dict[str, Tuple[int, ...]] | None = None,
+    canvas_size: int = 64,
+) -> tuple[dict[str, np.ndarray], float]:
+    """
+    Compute rigid-body topology loss (T2.5) using SSIM on canonicalized regions.
+
+    For each consecutive frame pair, region masks are built for head/torso/pelvis
+    in a canonical coordinate frame (center+scale normalized), then compared via SSIM.
+
+    L_topology = sum_{b,t,r} (1 - SSIM(M_{t-1,r}, M_{t,r}))
+
+    Parameters
+    ----------
+    pose_keypoints:
+        Pose tensor shaped ``[B, T, K, 2]`` or ``[T, K, 2]``.
+    regions:
+        Mapping of region name to keypoint indices.
+    canvas_size:
+        Mask raster size for region canonicalization.
+
+    Returns
+    -------
+    tuple[dict[str, np.ndarray], float]
+        ``(region_ssim, topology_loss)`` where each region SSIM array has shape ``[B, T-1]``.
+    """
+    keypoints = _coerce_pose_keypoints(pose_keypoints)
+    rigid_regions = regions if regions is not None else RIGID_REGIONS
+
+    if not rigid_regions:
+        raise ValueError("regions cannot be empty.")
+    if canvas_size < 8:
+        raise ValueError("canvas_size must be >= 8.")
+
+    batch_size, num_frames, num_keypoints, _ = keypoints.shape
+    _validate_region_indices(rigid_regions, num_keypoints=num_keypoints)
+
+    if num_frames < 2:
+        empty = {name: np.zeros((batch_size, 0), dtype=np.float32) for name in rigid_regions}
+        return empty, 0.0
+
+    region_ssim: dict[str, np.ndarray] = {
+        name: np.ones((batch_size, num_frames - 1), dtype=np.float32)
+        for name in rigid_regions
+    }
+
+    loss = 0.0
+    for b in range(batch_size):
+        for t in range(1, num_frames):
+            prev_frame = keypoints[b, t - 1]
+            curr_frame = keypoints[b, t]
+
+            for name, indices in rigid_regions.items():
+                prev_mask = _region_mask_from_keypoints(prev_frame, indices, canvas_size=canvas_size)
+                curr_mask = _region_mask_from_keypoints(curr_frame, indices, canvas_size=canvas_size)
+                ssim_value = _compute_ssim(prev_mask, curr_mask)
+                region_ssim[name][b, t - 1] = np.float32(ssim_value)
+                loss += (1.0 - ssim_value)
+
+    return region_ssim, float(loss)
+
+
+def _validate_region_indices(
+    regions: Dict[str, Tuple[int, ...]],
+    *,
+    num_keypoints: int,
+) -> None:
+    """Validate rigid region keypoint indices."""
+    for name, indices in regions.items():
+        if len(indices) < 3:
+            raise ValueError(f"region '{name}' must contain at least 3 keypoint indices.")
+        for idx in indices:
+            if idx < 0 or idx >= num_keypoints:
+                raise ValueError(
+                    f"region '{name}' index {idx} out of range for {num_keypoints} keypoints."
+                )
+
+
+def _region_mask_from_keypoints(
+    frame_keypoints: np.ndarray,
+    indices: Sequence[int],
+    *,
+    canvas_size: int,
+) -> np.ndarray:
+    """Build a canonicalized binary mask for a rigid region from frame keypoints."""
+    points = np.asarray(frame_keypoints[list(indices), :2], dtype=np.float32)
+
+    if points.shape[0] < 3 or not np.all(np.isfinite(points)):
+        return np.zeros((canvas_size, canvas_size), dtype=np.float32)
+
+    center = np.mean(points, axis=0)
+    centered = points - center
+    scale = float(np.max(np.linalg.norm(centered, axis=1)))
+
+    if scale < 1e-6:
+        return np.zeros((canvas_size, canvas_size), dtype=np.float32)
+
+    normalized = centered / (scale + 1e-6)
+    pixel_points = (normalized + 1.0) * 0.5 * float(canvas_size - 1)
+    pixel_points = np.clip(pixel_points, 0.0, float(canvas_size - 1))
+    pixel_points_i32 = np.round(pixel_points).astype(np.int32)
+
+    hull = cv2.convexHull(pixel_points_i32)
+    mask = np.zeros((canvas_size, canvas_size), dtype=np.float32)
+    cv2.fillConvexPoly(mask, hull, 1.0)
+    return mask
+
+
+def _compute_ssim(image_a: np.ndarray, image_b: np.ndarray) -> float:
+    """Compute a lightweight global SSIM score in [0, 1] for two float masks."""
+    x = np.asarray(image_a, dtype=np.float32)
+    y = np.asarray(image_b, dtype=np.float32)
+
+    if x.shape != y.shape:
+        raise ValueError("SSIM inputs must have the same shape.")
+
+    if np.max(x) == 0.0 and np.max(y) == 0.0:
+        return 1.0
+
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+
+    mu_x = float(np.mean(x))
+    mu_y = float(np.mean(y))
+    sigma_x = float(np.var(x))
+    sigma_y = float(np.var(y))
+    sigma_xy = float(np.mean((x - mu_x) * (y - mu_y)))
+
+    numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+    denominator = (mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2)
+
+    if denominator <= 0.0:
+        return 0.0
+
+    score = numerator / denominator
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def compute_l_physics(
     pose_keypoints: np.ndarray,
     bone_pairs: Sequence[tuple[int, int]] | None = None,
     v_max: float = V_MAX_DEFAULT,
     bone_weight: float = 1.0,
+    rom_weight: float = 1.0,
     velocity_weight: float = 1.0,
+    topology_weight: float = 1.0,
 ) -> dict[str, float]:
     """
-    Compute composite L_physics loss combining bone length invariance and velocity limits.
+    Compute composite L_physics loss combining bone, ROM, and velocity terms.
 
-    L_physics = bone_weight * L_bone + velocity_weight * L_velocity
+    L_physics = bone_weight * L_bone + rom_weight * L_ROM + velocity_weight * L_velocity
 
     Parameters
     ----------
@@ -620,21 +871,33 @@ def compute_l_physics(
         Maximum allowed velocity in units/frame. Default 2.0.
     bone_weight:
         Weight for bone length loss component.
+    rom_weight:
+        Weight for ROM loss component.
     velocity_weight:
         Weight for velocity loss component.
+    topology_weight:
+        Reserved for compatibility. Topology is reported separately.
 
     Returns
     -------
     dict[str, float]
-        Dict with 'bone_loss', 'velocity_loss', 'total_loss' keys.
+        Dict with 'bone_loss', 'rom_loss', 'velocity_loss', 'topology_loss', 'total_loss' keys.
     """
     _, bone_loss = bone_length_invariance_loss(pose_keypoints, bone_pairs=bone_pairs)
+    _, rom_loss = compute_rom_loss(pose_keypoints)
     _, velocity_loss = compute_velocity_loss(pose_keypoints, v_max=v_max)
+    _, topology_loss = compute_rigid_topology_loss(pose_keypoints)
 
-    total_loss = bone_weight * bone_loss + velocity_weight * velocity_loss
+    total_loss = (
+        bone_weight * bone_loss
+        + rom_weight * rom_loss
+        + velocity_weight * velocity_loss
+    )
 
     return {
         "bone_loss": bone_loss,
+        "rom_loss": rom_loss,
         "velocity_loss": velocity_loss,
+        "topology_loss": topology_loss,
         "total_loss": total_loss,
     }

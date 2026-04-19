@@ -10,9 +10,13 @@ import pytest
 
 from core.kinematic_guardrail import (
     COCO_BONES,
+    JOINT_ANGLE_LIMITS,
+    RIGID_REGIONS,
     V_MAX_DEFAULT,
     bone_length_invariance_loss,
     compute_bone_lengths,
+    compute_rom_loss,
+    compute_rigid_topology_loss,
     compute_velocity_loss,
     compute_l_physics,
 )
@@ -95,7 +99,9 @@ class TestLPhysics:
         pose = np.stack([base_pose, base_pose + 0.5], axis=0)[None, ...]
         result = compute_l_physics(pose)
         assert "bone_loss" in result
+        assert "rom_loss" in result
         assert "velocity_loss" in result
+        assert "topology_loss" in result
         assert "total_loss" in result
 
     def test_compute_l_physics_combines_weights(self, base_pose):
@@ -103,13 +109,144 @@ class TestLPhysics:
         frame0 = base_pose
         frame1 = base_pose + np.array([3.0, 0.0], dtype=np.float32)  # velocity violation
         pose = np.stack([frame0, frame1], axis=0)[None, ...]
-        result_default = compute_l_physics(pose, bone_weight=1.0, velocity_weight=1.0)
-        result_custom = compute_l_physics(pose, bone_weight=0.5, velocity_weight=2.0)
+        result_default = compute_l_physics(pose, bone_weight=1.0, rom_weight=1.0, velocity_weight=1.0)
+        result_custom = compute_l_physics(pose, bone_weight=0.5, rom_weight=0.25, velocity_weight=2.0)
         assert result_default["total_loss"] != result_custom["total_loss"]
 
     def test_compute_v_max_default(self):
         """V_MAX_DEFAULT should be 2.0."""
         assert V_MAX_DEFAULT == 2.0
+
+    def test_compute_l_physics_rom_weight_affects_total(self, base_pose):
+        """ROM weight should affect total loss when ROM violations exist."""
+        frame0 = _make_human_like_pose()
+        frame1 = frame0.copy()
+        frame1[15] += np.array([0.8, -0.1], dtype=np.float32)  # perturb left ankle -> knee angle shift
+        pose = np.stack([frame0, frame1], axis=0)[None, ...]
+
+        result_low_rom = compute_l_physics(
+            pose,
+            bone_weight=1.0,
+            rom_weight=0.2,
+            velocity_weight=1.0,
+        )
+        result_high_rom = compute_l_physics(
+            pose,
+            bone_weight=1.0,
+            rom_weight=2.0,
+            velocity_weight=1.0,
+        )
+
+        assert result_high_rom["total_loss"] > result_low_rom["total_loss"]
+
+
+class TestROMLoss:
+    def test_compute_rom_loss_returns_expected_shape(self):
+        base = _make_human_like_pose()
+        pose = np.stack([base, base + np.array([0.1, -0.1], dtype=np.float32)], axis=0)[None, ...]
+
+        joint_angles, rom_loss = compute_rom_loss(pose)
+
+        assert joint_angles.shape == (1, 2, len(JOINT_ANGLE_LIMITS))
+        assert isinstance(rom_loss, float)
+
+    def test_compute_rom_loss_zero_for_pose_within_limits(self):
+        base = _make_human_like_pose()
+        pose = np.stack([base, base], axis=0)[None, ...]
+
+        joint_angles, _ = compute_rom_loss(pose)
+        limits = {
+            joint_idx: (float(joint_angles[0, 0, j] - 1.0), float(joint_angles[0, 0, j] + 1.0))
+            for j, joint_idx in enumerate(sorted(JOINT_ANGLE_LIMITS.keys()))
+        }
+
+        _, rom_loss = compute_rom_loss(pose, joint_limits=limits)
+        assert rom_loss == pytest.approx(0.0, abs=1e-7)
+
+    def test_compute_rom_loss_positive_when_limit_violated(self):
+        base = _make_human_like_pose()
+        deformed = base.copy()
+        deformed[15] += np.array([1.5, 0.0], dtype=np.float32)  # force strong left knee bend
+        pose = np.stack([base, deformed], axis=0)[None, ...]
+
+        _, rom_loss = compute_rom_loss(pose)
+        assert rom_loss > 0.0
+
+    def test_compute_rom_loss_accepts_unbatched(self):
+        base = _make_human_like_pose()
+        pose = np.stack([base, base + np.array([0.2, 0.0], dtype=np.float32)], axis=0)
+
+        joint_angles, rom_loss = compute_rom_loss(pose)
+        assert joint_angles.shape == (1, 2, len(JOINT_ANGLE_LIMITS))
+        assert isinstance(rom_loss, float)
+
+
+def _make_human_like_pose() -> np.ndarray:
+    """Create a stable non-collinear 17-keypoint pose for topology tests."""
+    return np.array(
+        [
+            [0.00, 1.90],   # 0 nose
+            [-0.10, 2.00],  # 1 left_eye
+            [0.10, 2.00],   # 2 right_eye
+            [-0.22, 1.98],  # 3 left_ear
+            [0.22, 1.98],   # 4 right_ear
+            [-0.30, 1.55],  # 5 left_shoulder
+            [0.30, 1.55],   # 6 right_shoulder
+            [-0.48, 1.20],  # 7 left_elbow
+            [0.48, 1.20],   # 8 right_elbow
+            [-0.58, 0.90],  # 9 left_wrist
+            [0.58, 0.90],   # 10 right_wrist
+            [-0.20, 1.00],  # 11 left_hip
+            [0.20, 1.00],   # 12 right_hip
+            [-0.20, 0.55],  # 13 left_knee
+            [0.20, 0.55],   # 14 right_knee
+            [-0.20, 0.10],  # 15 left_ankle
+            [0.20, 0.10],   # 16 right_ankle
+        ],
+        dtype=np.float32,
+    )
+
+
+class TestRigidTopologyLoss:
+    def test_returns_expected_shapes(self):
+        base = _make_human_like_pose()
+        pose = np.stack([base, base + np.array([0.1, -0.2], dtype=np.float32)], axis=0)[None, ...]
+
+        region_ssim, loss = compute_rigid_topology_loss(pose)
+
+        assert set(region_ssim.keys()) == set(RIGID_REGIONS.keys())
+        for values in region_ssim.values():
+            assert values.shape == (1, 1)
+        assert isinstance(loss, float)
+
+    def test_loss_near_zero_for_rigid_translation(self):
+        base = _make_human_like_pose()
+        frame0 = base
+        frame1 = base + np.array([0.35, -0.27], dtype=np.float32)
+        frame2 = base + np.array([0.70, -0.54], dtype=np.float32)
+        pose = np.stack([frame0, frame1, frame2], axis=0)[None, ...]
+
+        _, loss = compute_rigid_topology_loss(pose)
+        assert loss == pytest.approx(0.0, abs=1e-4)
+
+    def test_loss_positive_for_region_deformation(self):
+        base = _make_human_like_pose()
+        deformed = base.copy()
+        deformed[6] += np.array([0.55, -0.35], dtype=np.float32)  # right shoulder shift
+        pose = np.stack([base, deformed], axis=0)[None, ...]
+
+        _, loss = compute_rigid_topology_loss(pose)
+        assert loss > 0.0
+
+    def test_single_frame_returns_zero_loss(self):
+        base = _make_human_like_pose()
+        pose = base[None, None, ...]
+
+        region_ssim, loss = compute_rigid_topology_loss(pose)
+
+        for values in region_ssim.values():
+            assert values.shape == (1, 0)
+        assert loss == 0.0
 
 
 def _make_base_pose(num_keypoints: int = 17) -> np.ndarray:
