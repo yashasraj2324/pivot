@@ -469,4 +469,139 @@ class TestInpaintingMaskGenerator:
         gen = InpaintingMaskGenerator(image_height=64, image_width=64)
         result = VerificationResult(passed=True)
         mask = gen.generate_from_verification_result(result)
-        assert mask.sum() == 64 * 64                   
+        assert mask.sum() == 64 * 64    
+
+class TestConstrainedRegenerationEngine:
+    """Test suite for ConstrainedRegenerationEngine — T3.6."""
+
+    def test_initialization(self):
+        """Should initialize with correct parameters."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        engine = ConstrainedRegenerationEngine()
+        assert engine.base_identity_weight == 0.7
+        assert engine.base_kinematic_weight == 0.7
+
+    def test_invalid_base_weight_raises(self):
+        """Invalid base weight should raise ValueError."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        with pytest.raises(ValueError):
+            ConstrainedRegenerationEngine(base_identity_weight=1.5)
+
+    def test_invalid_increment_raises(self):
+        """Negative increment should raise ValueError."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        with pytest.raises(ValueError):
+            ConstrainedRegenerationEngine(identity_increment=-0.1)
+
+    def test_no_failure_returns_base_weights(self):
+        """No failure should return base weights."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        engine = ConstrainedRegenerationEngine(
+            base_identity_weight=0.7,
+            base_kinematic_weight=0.7,
+        )
+        result = VerificationResult(passed=True)
+        config = engine.get_config(result, retry_count=0)
+        assert config.identity_weight == pytest.approx(0.7)
+        assert config.kinematic_weight == pytest.approx(0.7)
+        assert config.violated_constraint == "none"
+
+    def test_identity_failure_increases_identity_weight(self):
+        """Identity failure should increase identity weight."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        from core.cosine_similarity_gate import IdentityGateResult
+        engine = ConstrainedRegenerationEngine(
+            base_identity_weight=0.7,
+            identity_increment=0.1,
+        )
+        result = VerificationResult(
+            passed=False,
+            identity_result=IdentityGateResult(
+                passed=False, similarity_score=0.5, threshold=0.9
+            ),
+        )
+        config = engine.get_config(result, retry_count=2)
+        assert config.identity_weight == pytest.approx(0.9)
+        assert config.kinematic_weight == pytest.approx(0.7)
+        assert config.violated_constraint == "identity"
+
+    def test_kinematic_failure_increases_kinematic_weight(self):
+        """Kinematic failure should increase kinematic weight."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        engine = ConstrainedRegenerationEngine(
+            base_kinematic_weight=0.7,
+            kinematic_increment=0.1,
+        )
+        result = VerificationResult(
+            passed=False,
+            kinematic_result=KinematicResult(passed=False, total_loss=2.0),
+        )
+        config = engine.get_config(result, retry_count=1)
+        assert config.kinematic_weight == pytest.approx(0.8)
+        assert config.identity_weight == pytest.approx(0.7)
+        assert config.violated_constraint == "kinematic"
+
+    def test_both_failures_increases_both_weights(self):
+        """Both failures should increase both weights."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        from core.cosine_similarity_gate import IdentityGateResult
+        engine = ConstrainedRegenerationEngine(
+            base_identity_weight=0.7,
+            base_kinematic_weight=0.7,
+            identity_increment=0.1,
+            kinematic_increment=0.1,
+        )
+        result = VerificationResult(
+            passed=False,
+            identity_result=IdentityGateResult(
+                passed=False, similarity_score=0.5, threshold=0.9
+            ),
+            kinematic_result=KinematicResult(passed=False, total_loss=2.0),
+        )
+        config = engine.get_config(result, retry_count=1)
+        assert config.identity_weight == pytest.approx(0.8)
+        assert config.kinematic_weight == pytest.approx(0.8)
+        assert config.violated_constraint == "both"
+
+    def test_weight_caps_at_max(self):
+        """Weight should not exceed max."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        from core.cosine_similarity_gate import IdentityGateResult
+        engine = ConstrainedRegenerationEngine(
+            base_identity_weight=0.7,
+            identity_increment=0.1,
+            max_identity_weight=0.9,
+        )
+        result = VerificationResult(
+            passed=False,
+            identity_result=IdentityGateResult(
+                passed=False, similarity_score=0.5, threshold=0.9
+            ),
+        )
+        config = engine.get_config(result, retry_count=10)
+        assert config.identity_weight == pytest.approx(0.9)
+
+    def test_get_identity_weight_shortcut(self):
+        """get_identity_weight should return correct weight."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        from core.cosine_similarity_gate import IdentityGateResult
+        engine = ConstrainedRegenerationEngine(
+            base_identity_weight=0.7,
+            identity_increment=0.1,
+        )
+        result = VerificationResult(
+            passed=False,
+            identity_result=IdentityGateResult(
+                passed=False, similarity_score=0.5, threshold=0.9
+            ),
+        )
+        weight = engine.get_identity_weight(result, retry_count=1)
+        assert weight == pytest.approx(0.8)
+
+    def test_config_includes_retry_count(self):
+        """Config should store retry count."""
+        from core.verification_daemon import ConstrainedRegenerationEngine
+        engine = ConstrainedRegenerationEngine()
+        result = VerificationResult(passed=True)
+        config = engine.get_config(result, retry_count=3)
+        assert config.retry_count == 3                       

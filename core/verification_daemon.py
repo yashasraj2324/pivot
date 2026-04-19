@@ -687,3 +687,151 @@ class InpaintingMaskGenerator:
             min(self.image_width, x2),
             min(self.image_height, y2),
         )    
+    
+@dataclass
+class ConstrainedRegenerationConfig:
+    """
+    Configuration for a constrained regeneration pass.
+    
+    Produced by ConstrainedRegenerationEngine based on what failed.
+    The generation pass uses these weights to bias regeneration
+    toward fixing the violated constraint.
+    """
+    identity_weight: float = 0.7
+    kinematic_weight: float = 0.7
+    inpainting_mask: Optional[np.ndarray] = None
+    retry_count: int = 0
+    violated_constraint: str = "none"  # "identity", "kinematic", "both", "none"
+
+
+class ConstrainedRegenerationEngine:
+    """
+    Produces constrained regeneration configs based on verification failures.
+
+    Per ADR-003: The regeneration pass is conditioned on all active constraints
+    with increased weight on the violated constraint.
+
+    Usage:
+        engine = ConstrainedRegenerationEngine()
+        config = engine.get_config(result, retry_count=1)
+        # use config.identity_weight in generation_fn
+    """
+
+    def __init__(
+        self,
+        base_identity_weight: float = 0.7,
+        base_kinematic_weight: float = 0.7,
+        identity_increment: float = 0.1,
+        kinematic_increment: float = 0.1,
+        max_identity_weight: float = 1.0,
+        max_kinematic_weight: float = 1.0,
+        mask_generator: Optional["InpaintingMaskGenerator"] = None,
+    ):
+        """
+        Args:
+            base_identity_weight: Starting identity conditioning weight.
+            base_kinematic_weight: Starting kinematic conditioning weight.
+            identity_increment: Weight increase per retry for identity failures.
+            kinematic_increment: Weight increase per retry for kinematic failures.
+            max_identity_weight: Maximum identity weight cap.
+            max_kinematic_weight: Maximum kinematic weight cap.
+            mask_generator: Optional InpaintingMaskGenerator for mask generation.
+        """
+        if not 0.0 <= base_identity_weight <= 1.0:
+            raise ValueError("base_identity_weight must be in [0.0, 1.0]")
+        if not 0.0 <= base_kinematic_weight <= 1.0:
+            raise ValueError("base_kinematic_weight must be in [0.0, 1.0]")
+        if identity_increment < 0:
+            raise ValueError("identity_increment must be >= 0")
+        if kinematic_increment < 0:
+            raise ValueError("kinematic_increment must be >= 0")
+
+        self.base_identity_weight = base_identity_weight
+        self.base_kinematic_weight = base_kinematic_weight
+        self.identity_increment = identity_increment
+        self.kinematic_increment = kinematic_increment
+        self.max_identity_weight = max_identity_weight
+        self.max_kinematic_weight = max_kinematic_weight
+        self.mask_generator = mask_generator
+
+    def get_config(
+        self,
+        result: VerificationResult,
+        retry_count: int = 0,
+        pose_keypoints: Optional[np.ndarray] = None,
+    ) -> ConstrainedRegenerationConfig:
+        """
+        Produce a regeneration config based on what failed.
+
+        Increases weight only on the violated constraint.
+        Unviolated constraints keep their base weight.
+
+        Args:
+            result: VerificationResult from the daemon.
+            retry_count: Current retry attempt number.
+            pose_keypoints: Optional pose keypoints for mask generation.
+
+        Returns:
+            ConstrainedRegenerationConfig with adjusted weights.
+        """
+        identity_failed = (
+            result.identity_result is not None
+            and not result.identity_result.passed
+        )
+        kinematic_failed = (
+            result.kinematic_result is not None
+            and not result.kinematic_result.passed
+        )
+
+        # compute weights — only increase weight on violated constraint
+        identity_weight = self.base_identity_weight
+        kinematic_weight = self.base_kinematic_weight
+
+        if identity_failed:
+            identity_weight = min(
+                self.base_identity_weight + retry_count * self.identity_increment,
+                self.max_identity_weight,
+            )
+
+        if kinematic_failed:
+            kinematic_weight = min(
+                self.base_kinematic_weight + retry_count * self.kinematic_increment,
+                self.max_kinematic_weight,
+            )
+
+        # determine which constraint was violated
+        if identity_failed and kinematic_failed:
+            violated = "both"
+        elif identity_failed:
+            violated = "identity"
+        elif kinematic_failed:
+            violated = "kinematic"
+        else:
+            violated = "none"
+
+        # generate inpainting mask if generator is available
+        mask = None
+        if self.mask_generator is not None:
+            mask = self.mask_generator.generate_from_verification_result(
+                result, pose_keypoints=pose_keypoints
+            )
+
+        return ConstrainedRegenerationConfig(
+            identity_weight=identity_weight,
+            kinematic_weight=kinematic_weight,
+            inpainting_mask=mask,
+            retry_count=retry_count,
+            violated_constraint=violated,
+        )
+
+    def get_identity_weight(
+        self,
+        result: VerificationResult,
+        retry_count: int = 0,
+    ) -> float:
+        """
+        Get just the identity weight for quick access.
+        Compatible with VerificationDaemon.generation_fn signature.
+        """
+        config = self.get_config(result, retry_count=retry_count)
+        return config.identity_weight    
