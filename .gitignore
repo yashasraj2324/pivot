@@ -70,6 +70,7 @@ CLAUDE.md
 # Sphinx documentation
 docs/_build/
 
+
 # PyBuilder
 .pybuilder/
 target/
@@ -132,7 +133,7 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
-
+streamed-foraging-sutherland.md
 # Pyre type checker
 .pyre/
 

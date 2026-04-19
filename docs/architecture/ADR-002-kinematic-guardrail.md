@@ -1,5 +1,5 @@
 # ADR-002: Kinematic Guardrail Implementation Details
-**Date**: 2026-04-14 | **Status**: Proposed
+**Date**: 2026-04-14 | **Status**: Implemented
 **Author**: ai-architect agent
 
 ## Context
@@ -48,5 +48,39 @@ Selected Option A: DWPose (ControlNet) for pose estimation + custom bone length 
 - L_physics composite metric combines all constraints with threshold ≤ 0.01
 - Memory efficient for T4 GPU deployment
 
+## Implementation Status
+All Phase 1 features implemented (T2.4):
+
+### Kinematic Guardrail (kinematic_guardrail.py)
+- `compute_velocity_loss()` - L_velocity = Σ max(0, ||Δp|| - v_max)²
+- `compute_l_physics()` - composite loss combining bone + velocity with configurable weights
+- Default v_max = 2.0 units/frame as specified
+- Bone length invariance via `bone_length_invariance_loss()`
+- Joint angle limits via `compute_rom_loss()` and `clamp_joint_angles()`
+
+### Verification Daemon Integration (verification_daemon.py)
+- New `KinematicResult` dataclass stores bone_loss, velocity_loss, total_loss, v_max, max_velocity
+- `verify_kinematic()` method checks pose keypoints against L_physics constraints
+- Kinematic check runs BEFORE identity check in `run()` and `verify_single_pass()`
+- Early halt on kinematic failure (skips identity retries)
+- Configurable `v_max`, `kinematic_threshold`, `enable_kinematic` parameters
+
+### Tests (tests/core/test_kinematic_guardrail.py)
+- 10 new velocity tests in `TestVelocityLoss` class
+- 3 new L_physics tests in `TestLPhysics` class
+- All 17 kinematic guardrail tests pass
+
+### Validation Notebook (notebooks/phase1/kinematic_guardrail/kinematic_guardrail_validation_new.ipynb)
+- Velocity loss test with valid/invalid motion
+- L_physics composite loss test
+- v_max threshold sensitivity experiment
+
+## Integration Flow
+```
+Generation Output → verify_kinematic() → PASS → verify_identity() → PASS → Output
+                               ↓ FAIL (halt early, skip identity)
+                          Correction Trigger
+```
+
 ## Open Questions
-<!-- PM-OPEN --> Need to validate joint angle calculation method from 2D keypoints; may require 3D lifting or confidence-based weighting
+<!-- CLOSED --> All Phase 1 kinematic features implemented and tested. Velocity limits verified through notebook experiments.
