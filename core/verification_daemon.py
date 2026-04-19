@@ -461,3 +461,229 @@ class LatentStateManager:
             daemon = VerificationDaemon(latent_rewind_fn=manager.as_rewind_fn())
         """
         return self.rewind
+
+class InpaintingMaskGenerator:
+    """
+    Generates segmentation masks over failing regions for localized inpainting.
+
+    Per ADR-003: Only the failing region is regenerated — not the full frame.
+    Supports two failure types:
+    - Identity failure: mask covers the face region
+    - Kinematic failure: mask covers the violating joint region
+    """
+
+    # Face region keypoint indices (COCO)
+    FACE_KEYPOINTS = [0, 1, 2, 3, 4]  # nose, eyes, ears
+
+    # Joint region keypoint indices grouped by body part
+    JOINT_REGIONS = {
+        "left_arm":  [5, 7, 9],   # shoulder, elbow, wrist
+        "right_arm": [6, 8, 10],
+        "left_leg":  [11, 13, 15], # hip, knee, ankle
+        "right_leg": [12, 14, 16],
+        "torso":     [5, 6, 11, 12],
+    }
+
+    def __init__(
+        self,
+        image_height: int = 512,
+        image_width: int = 512,
+        dilation_px: int = 32,
+        face_bbox_expansion: float = 0.3,
+    ):
+        """
+        Args:
+            image_height: Height of the output mask in pixels.
+            image_width: Width of the output mask in pixels.
+            dilation_px: Pixels to expand the mask beyond the detected region.
+            face_bbox_expansion: Fractional expansion of face bounding box.
+        """
+        if image_height < 1 or image_width < 1:
+            raise ValueError("image_height and image_width must be >= 1")
+        if dilation_px < 0:
+            raise ValueError("dilation_px must be >= 0")
+
+        self.image_height = image_height
+        self.image_width = image_width
+        self.dilation_px = dilation_px
+        self.face_bbox_expansion = face_bbox_expansion
+
+    def generate_face_mask(
+        self,
+        pose_keypoints: Optional[np.ndarray] = None,
+        face_bbox: Optional[tuple[int, int, int, int]] = None,
+    ) -> np.ndarray:
+        """
+        Generate a mask covering the face region.
+
+        Args:
+            pose_keypoints: Shape (17, 2) or (17, 3). Uses face keypoints
+                            to estimate face center and size.
+            face_bbox: Optional explicit (x1, y1, x2, y2) bounding box.
+
+        Returns:
+            Binary mask of shape (H, W) with float32 values in [0, 1].
+        """
+        mask = np.zeros((self.image_height, self.image_width), dtype=np.float32)
+
+        if face_bbox is not None:
+            x1, y1, x2, y2 = face_bbox
+        elif pose_keypoints is not None:
+            x1, y1, x2, y2 = self._keypoints_to_bbox(
+                pose_keypoints, self.FACE_KEYPOINTS
+            )
+        else:
+            # fallback: mask center quarter of image
+            x1 = self.image_width // 4
+            y1 = self.image_height // 4
+            x2 = self.image_width * 3 // 4
+            y2 = self.image_height * 3 // 4
+
+        x1, y1, x2, y2 = self._expand_bbox(x1, y1, x2, y2, self.face_bbox_expansion)
+        x1, y1, x2, y2 = self._dilate_bbox(x1, y1, x2, y2)
+        x1, y1, x2, y2 = self._clamp_bbox(x1, y1, x2, y2)
+
+        mask[y1:y2, x1:x2] = 1.0
+        return mask
+
+    def generate_joint_mask(
+        self,
+        pose_keypoints: np.ndarray,
+        violating_joints: Optional[list[int]] = None,
+    ) -> np.ndarray:
+        """
+        Generate a mask covering violating joint regions.
+
+        Args:
+            pose_keypoints: Shape (17, 2) or (17, 3).
+            violating_joints: List of joint indices that violated constraints.
+                              If None, masks all joint regions.
+
+        Returns:
+            Binary mask of shape (H, W) with float32 values in [0, 1].
+        """
+        mask = np.zeros((self.image_height, self.image_width), dtype=np.float32)
+
+        if violating_joints is not None:
+            indices = violating_joints
+        else:
+            indices = list(range(min(17, pose_keypoints.shape[0])))
+
+        if len(indices) == 0:
+            return mask
+
+        x1, y1, x2, y2 = self._keypoints_to_bbox(pose_keypoints, indices)
+        x1, y1, x2, y2 = self._dilate_bbox(x1, y1, x2, y2)
+        x1, y1, x2, y2 = self._clamp_bbox(x1, y1, x2, y2)
+
+        mask[y1:y2, x1:x2] = 1.0
+        return mask
+
+    def generate_from_verification_result(
+        self,
+        result: VerificationResult,
+        pose_keypoints: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Automatically generate the right mask based on what failed.
+
+        - Identity failure → face mask
+        - Kinematic failure → joint mask over violating region
+        - Both failed → union of both masks
+
+        Args:
+            result: VerificationResult from the daemon.
+            pose_keypoints: Optional pose keypoints for joint masking.
+
+        Returns:
+            Binary mask of shape (H, W).
+        """
+        mask = np.zeros((self.image_height, self.image_width), dtype=np.float32)
+
+        identity_failed = (
+            result.identity_result is not None
+            and not result.identity_result.passed
+        )
+        kinematic_failed = (
+            result.kinematic_result is not None
+            and not result.kinematic_result.passed
+        )
+
+        if identity_failed:
+            face_mask = self.generate_face_mask(pose_keypoints=pose_keypoints)
+            mask = np.maximum(mask, face_mask)
+
+        if kinematic_failed and pose_keypoints is not None:
+            joint_mask = self.generate_joint_mask(pose_keypoints)
+            mask = np.maximum(mask, joint_mask)
+
+        # fallback: if nothing specific failed, mask full frame
+        if not identity_failed and not kinematic_failed:
+            mask = np.ones((self.image_height, self.image_width), dtype=np.float32)
+
+        return mask
+
+    def _keypoints_to_bbox(
+        self,
+        pose_keypoints: np.ndarray,
+        indices: list[int],
+    ) -> tuple[int, int, int, int]:
+        """Compute bounding box from selected keypoint indices."""
+        kpts = np.asarray(pose_keypoints, dtype=np.float32)
+        valid_indices = [i for i in indices if i < kpts.shape[0]]
+
+        if not valid_indices:
+            return 0, 0, self.image_width, self.image_height
+
+        selected = kpts[valid_indices, :2]
+
+        # filter out zero-confidence points if confidence column exists
+        if kpts.shape[1] >= 3:
+            conf = kpts[valid_indices, 2]
+            selected = selected[conf > 0.1]
+
+        if len(selected) == 0:
+            return 0, 0, self.image_width, self.image_height
+
+        x1 = int(np.min(selected[:, 0]))
+        y1 = int(np.min(selected[:, 1]))
+        x2 = int(np.max(selected[:, 0]))
+        y2 = int(np.max(selected[:, 1]))
+
+        return x1, y1, x2, y2
+
+    def _expand_bbox(
+        self,
+        x1: int, y1: int, x2: int, y2: int,
+        expansion: float,
+    ) -> tuple[int, int, int, int]:
+        """Expand bbox by a fractional amount."""
+        w = max(x2 - x1, 1)
+        h = max(y2 - y1, 1)
+        pad_x = int(w * expansion)
+        pad_y = int(h * expansion)
+        return x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y
+
+    def _dilate_bbox(
+        self,
+        x1: int, y1: int, x2: int, y2: int,
+    ) -> tuple[int, int, int, int]:
+        """Expand bbox by fixed dilation_px pixels."""
+        return (
+            x1 - self.dilation_px,
+            y1 - self.dilation_px,
+            x2 + self.dilation_px,
+            y2 + self.dilation_px,
+        )
+
+    def _clamp_bbox(
+        self,
+        x1: int, y1: int, x2: int, y2: int,
+    ) -> tuple[int, int, int, int]:
+        """Clamp bbox to image boundaries."""
+        return (
+            max(0, x1),
+            max(0, y1),
+            min(self.image_width, x2),
+            min(self.image_height, y2),
+        )    

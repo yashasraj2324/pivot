@@ -7,6 +7,7 @@ import pytest
 from core.verification_daemon import (
     VerificationDaemon,
     VerificationResult,
+    KinematicResult,
     CorrectionTrigger,
     LatentRewindTrigger,
     LocalizedInpaintingTrigger,
@@ -358,4 +359,114 @@ class TestLatentStateManager:
         from core.verification_daemon import LatentStateManager
 
         with pytest.raises(ValueError):
-            LatentStateManager(max_history=0)        
+            LatentStateManager(max_history=0) 
+
+class TestInpaintingMaskGenerator:
+    """Test suite for InpaintingMaskGenerator — T3.5."""
+
+    def test_initialization(self):
+        """Should initialize with correct parameters."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=512, image_width=512)
+        assert gen.image_height == 512
+        assert gen.image_width == 512
+
+    def test_invalid_dimensions_raises(self):
+        """image_height/width < 1 should raise ValueError."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        with pytest.raises(ValueError):
+            InpaintingMaskGenerator(image_height=0, image_width=512)
+
+    def test_invalid_dilation_raises(self):
+        """Negative dilation should raise ValueError."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        with pytest.raises(ValueError):
+            InpaintingMaskGenerator(dilation_px=-1)
+
+    def test_face_mask_shape(self):
+        """Face mask should match image dimensions."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=256, image_width=256)
+        mask = gen.generate_face_mask()
+        assert mask.shape == (256, 256)
+        assert mask.dtype == np.float32
+
+    def test_face_mask_values_clamped(self):
+        """Face mask values must be in [0, 1]."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=256, image_width=256)
+        mask = gen.generate_face_mask()
+        assert mask.min() >= 0.0
+        assert mask.max() <= 1.0
+
+    def test_face_mask_with_pose_keypoints(self):
+        """Face mask should use pose keypoints when provided."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=256, image_width=256, dilation_px=10)
+        keypoints = np.zeros((17, 3), dtype=np.float32)
+        keypoints[0] = [128, 50, 1.0]  # nose
+        keypoints[1] = [120, 45, 1.0]  # left_eye
+        keypoints[2] = [136, 45, 1.0]  # right_eye
+        mask = gen.generate_face_mask(pose_keypoints=keypoints)
+        assert mask.sum() > 0
+
+    def test_face_mask_with_explicit_bbox(self):
+        """Face mask should use explicit bbox when provided."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=256, image_width=256, dilation_px=0)
+        mask = gen.generate_face_mask(face_bbox=(50, 50, 150, 150))
+        assert mask[100, 100] == 1.0
+        assert mask[0, 0] == 0.0
+
+    def test_joint_mask_shape(self):
+        """Joint mask should match image dimensions."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=256, image_width=256)
+        keypoints = np.zeros((17, 2), dtype=np.float32)
+        keypoints[5] = [100, 100]
+        keypoints[7] = [120, 150]
+        mask = gen.generate_joint_mask(keypoints, violating_joints=[5, 7])
+        assert mask.shape == (256, 256)
+
+    def test_joint_mask_covers_violating_region(self):
+        """Joint mask should cover the violating joint area."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=256, image_width=256, dilation_px=5)
+        keypoints = np.zeros((17, 2), dtype=np.float32)
+        keypoints[7] = [128, 128]  # left elbow
+        mask = gen.generate_joint_mask(keypoints, violating_joints=[7])
+        assert mask[128, 128] == 1.0
+
+    def test_generate_from_identity_failure(self):
+        """Identity failure should produce face mask."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        from core.cosine_similarity_gate import IdentityGateResult
+        gen = InpaintingMaskGenerator(image_height=256, image_width=256)
+        result = VerificationResult(
+            passed=False,
+            identity_result=IdentityGateResult(
+                passed=False, similarity_score=0.5, threshold=0.9
+            ),
+        )
+        mask = gen.generate_from_verification_result(result)
+        assert mask.shape == (256, 256)
+        assert mask.sum() > 0
+
+    def test_generate_from_kinematic_failure(self):
+        """Kinematic failure with keypoints should produce joint mask."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=256, image_width=256)
+        kinematic = KinematicResult(passed=False, total_loss=2.0)
+        result = VerificationResult(passed=False, kinematic_result=kinematic)
+        keypoints = np.zeros((17, 2), dtype=np.float32)
+        keypoints[5] = [100, 100]
+        mask = gen.generate_from_verification_result(result, pose_keypoints=keypoints)
+        assert mask.sum() > 0
+
+    def test_generate_fallback_full_frame(self):
+        """No specific failure should mask full frame."""
+        from core.verification_daemon import InpaintingMaskGenerator
+        gen = InpaintingMaskGenerator(image_height=64, image_width=64)
+        result = VerificationResult(passed=True)
+        mask = gen.generate_from_verification_result(result)
+        assert mask.sum() == 64 * 64                   
