@@ -713,6 +713,54 @@ class TestT41IdentityRouterToDaemonIntegration:
         direct_score = cosine_similarity(ref, ref)
         gate_score = daemon.get_identity_similarity(ref, ref)
         assert abs(direct_score - gate_score) < 1e-5   
+
+
+class TestT32IdentityGateIntegration:
+    """T3.2: Identity check wired from ArcFace extraction into the cosine gate."""
+
+    def test_verify_identity_from_images_uses_arcface_embeddings(self, monkeypatch):
+        """Image paths should be converted to embeddings before cosine gating."""
+        from core import verification_daemon as vd
+
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        gen = ref.copy()
+
+        calls = []
+
+        def fake_extract(image_path, **kwargs):
+            calls.append(image_path)
+            return ref if image_path == "ref.png" else gen
+
+        monkeypatch.setattr(vd, "extract_arcface_embedding", fake_extract)
+
+        daemon = VerificationDaemon(enable_logging=False)
+        result = daemon.verify_identity_from_images("ref.png", "gen.png")
+
+        assert result.passed is True
+        assert result.similarity_score == pytest.approx(1.0, abs=1e-5)
+        assert calls == ["ref.png", "gen.png"]
+
+    def test_run_from_images_keeps_existing_workflow(self, monkeypatch):
+        """run_from_images should feed extracted embeddings into the normal workflow."""
+        from core import verification_daemon as vd
+
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+
+        def fake_extract(image_path, **kwargs):
+            return ref if image_path == "ref.png" else bad
+
+        monkeypatch.setattr(vd, "extract_arcface_embedding", fake_extract)
+
+        daemon = VerificationDaemon(max_retries=0, enable_logging=False)
+        result = daemon.run_from_images("ref.png", "gen.png")
+
+        assert result.identity_result is not None
+        assert result.identity_result.passed is False
+        assert result.final_similarity is not None
         
 class TestT42KinematicGuardrailToDaemonIntegration:
     """T4.2: Kinematic Guardrail connected to Verification Daemon."""
@@ -777,7 +825,9 @@ class TestT42KinematicGuardrailToDaemonIntegration:
         pose = np.zeros((2, 17, 2), dtype=np.float32)
         result = daemon.verify_kinematic(pose)
         assert hasattr(result, 'bone_loss')
+        assert hasattr(result, 'rom_loss')
         assert hasattr(result, 'velocity_loss')
+        assert hasattr(result, 'topology_loss')
         assert hasattr(result, 'total_loss')
         assert hasattr(result, 'max_velocity')   
         
