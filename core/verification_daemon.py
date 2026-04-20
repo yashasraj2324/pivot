@@ -11,6 +11,7 @@ from typing import Optional, Callable, Sequence
 import numpy as np
 
 from core.cosine_similarity_gate import CosineSimilarityGate, IdentityGateResult
+from core.identity_router import extract_arcface_embedding
 from core.kinematic_guardrail import (
     V_MAX_DEFAULT,
     compute_l_physics,
@@ -185,6 +186,35 @@ class VerificationDaemon:
         """
         return self.identity_gate(reference_embedding, generated_embedding)
 
+    def verify_identity_from_images(
+        self,
+        reference_image_path: str,
+        generated_image_path: str,
+        *,
+        model_name: str = "buffalo_l",
+        ctx_id: int = 0,
+        multi_face_policy: str = "largest",
+    ) -> IdentityGateResult:
+        """
+        Extract ArcFace embeddings from image paths and evaluate identity.
+
+        This is the T3.2 integration path: ArcFace embedding extraction -> cosine
+        similarity gate -> pass/fail result for the verification daemon.
+        """
+        reference_embedding = extract_arcface_embedding(
+            reference_image_path,
+            model_name=model_name,
+            ctx_id=ctx_id,
+            multi_face_policy=multi_face_policy,
+        )
+        generated_embedding = extract_arcface_embedding(
+            generated_image_path,
+            model_name=model_name,
+            ctx_id=ctx_id,
+            multi_face_policy=multi_face_policy,
+        )
+        return self.verify_identity(reference_embedding, generated_embedding)
+
     def verify_kinematic(
         self,
         pose_keypoints: np.ndarray,
@@ -311,6 +341,42 @@ class VerificationDaemon:
             latent_rewind_count=latent_rewind_count,
             final_similarity=identity_result.similarity_score if identity_result else None,
         )
+
+    def run_from_images(
+        self,
+        reference_image_path: str,
+        generated_image_path: str,
+        pose_keypoints: Optional[np.ndarray] = None,
+        generation_fn: Optional[Callable[[float], np.ndarray]] = None,
+        *,
+        model_name: str = "buffalo_l",
+        ctx_id: int = 0,
+        multi_face_policy: str = "largest",
+    ) -> VerificationResult:
+        """
+        Run verification by extracting ArcFace embeddings from image inputs first.
+
+        This keeps the existing embedding-based workflow intact while providing
+        a direct T3.2 integration path from images to the cosine gate.
+        """
+        reference_embedding = extract_arcface_embedding(
+            reference_image_path,
+            model_name=model_name,
+            ctx_id=ctx_id,
+            multi_face_policy=multi_face_policy,
+        )
+        generated_embedding = extract_arcface_embedding(
+            generated_image_path,
+            model_name=model_name,
+            ctx_id=ctx_id,
+            multi_face_policy=multi_face_policy,
+        )
+        return self.run(
+            reference_embedding,
+            generated_embedding,
+            pose_keypoints=pose_keypoints,
+            generation_fn=generation_fn,
+        )
     
     def verify_single_pass(
         self,
@@ -352,6 +418,35 @@ class VerificationDaemon:
             retry_count=0,
             max_retries=self.max_retries,
             final_similarity=identity_result.similarity_score if identity_result else None,
+        )
+
+    def verify_single_pass_from_images(
+        self,
+        reference_image_path: str,
+        generated_image_path: str,
+        pose_keypoints: Optional[np.ndarray] = None,
+        *,
+        model_name: str = "buffalo_l",
+        ctx_id: int = 0,
+        multi_face_policy: str = "largest",
+    ) -> VerificationResult:
+        """Single-pass verification using ArcFace embeddings extracted from image paths."""
+        reference_embedding = extract_arcface_embedding(
+            reference_image_path,
+            model_name=model_name,
+            ctx_id=ctx_id,
+            multi_face_policy=multi_face_policy,
+        )
+        generated_embedding = extract_arcface_embedding(
+            generated_image_path,
+            model_name=model_name,
+            ctx_id=ctx_id,
+            multi_face_policy=multi_face_policy,
+        )
+        return self.verify_single_pass(
+            reference_embedding,
+            generated_embedding,
+            pose_keypoints=pose_keypoints,
         )
     
     def set_identity_threshold(self, threshold: float) -> None:
