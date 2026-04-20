@@ -8,6 +8,7 @@ and correction loops for the PIVOT generation pipeline.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Sequence
+import inspect
 import numpy as np
 
 from core.cosine_similarity_gate import CosineSimilarityGate, IdentityGateResult
@@ -166,6 +167,11 @@ class VerificationDaemon:
 
         self._correction_triggers: list[CorrectionTrigger] = []
         self._identity_weight_trigger = IdentityWeightIncreaseTrigger()
+        # T3.5 + T3.6 utilities used by the correction loop.
+        self._mask_generator = InpaintingMaskGenerator()
+        self._regeneration_engine = ConstrainedRegenerationEngine(
+            mask_generator=self._mask_generator,
+        )
         
     def register_correction_trigger(self, trigger: CorrectionTrigger) -> None:
         """Register a correction trigger to be invoked on failure."""
@@ -262,7 +268,7 @@ class VerificationDaemon:
         reference_embedding: np.ndarray,
         generated_embedding: np.ndarray,
         pose_keypoints: Optional[np.ndarray] = None,
-        generation_fn: Optional[Callable[[float], np.ndarray]] = None,
+        generation_fn: Optional[Callable[..., np.ndarray | dict[str, np.ndarray] | tuple[np.ndarray, np.ndarray]]] = None,
     ) -> VerificationResult:
         """
         Run verification with correction loop.
@@ -282,31 +288,46 @@ class VerificationDaemon:
         """
         retry_count = 0
         latent_rewind_count = 0
-        candidates: list[tuple[float, IdentityGateResult]] = []
 
         kinematic_result = None
         if pose_keypoints is not None and self.enable_kinematic:
             kinematic_result = self.verify_kinematic(pose_keypoints)
-            if not kinematic_result.passed:
-                if self.enable_logging:
-                    print(f"[VerificationDaemon] Kinematic check failed, halting early")
-                return VerificationResult(
-                    passed=False,
-                    identity_result=None,
-                    kinematic_result=kinematic_result,
-                    retry_count=0,
-                    max_retries=self.max_retries,
-                )
+
+        # Preserve strict sequential semantics when no correction function is provided.
+        if kinematic_result is not None and not kinematic_result.passed and generation_fn is None:
+            if self.enable_logging:
+                print("[VerificationDaemon] Kinematic check failed, halting early")
+            return VerificationResult(
+                passed=False,
+                identity_result=None,
+                kinematic_result=kinematic_result,
+                retry_count=0,
+                max_retries=self.max_retries,
+                final_similarity=None,
+            )
 
         identity_result = self.verify_identity(reference_embedding, generated_embedding)
-        candidates.append((identity_result.similarity_score, identity_result))
+
+        current_result = VerificationResult(
+            passed=(identity_result.passed and (kinematic_result is None or kinematic_result.passed)),
+            identity_result=identity_result,
+            kinematic_result=kinematic_result,
+            retry_count=0,
+            max_retries=self.max_retries,
+            final_similarity=identity_result.similarity_score,
+        )
+
+        candidates: list[VerificationResult] = [current_result]
 
         if self.enable_logging:
-            print(f"[VerificationDaemon] Initial check: identity={'PASS' if identity_result.passed else 'FAIL'}")
+            kin_status = "N/A" if kinematic_result is None else ("PASS" if kinematic_result.passed else "FAIL")
+            print(
+                f"[VerificationDaemon] Initial check: "
+                f"identity={'PASS' if identity_result.passed else 'FAIL'}, kinematic={kin_status}"
+            )
 
-        while not identity_result.passed and retry_count < self.max_retries:
+        while not current_result.passed and retry_count < self.max_retries:
             retry_count += 1
-
             if self.enable_logging:
                 print(f"[VerificationDaemon] Retry {retry_count}/{self.max_retries}")
 
@@ -315,37 +336,125 @@ class VerificationDaemon:
                 if rewound is not None:
                     latent_rewind_count += 1
 
-            new_weight = self._identity_weight_trigger(
-                VerificationResult(passed=False, retry_count=retry_count)
+            regen_config = self._regeneration_engine.get_config(
+                current_result,
+                retry_count=retry_count,
+                pose_keypoints=pose_keypoints,
             )
 
+            if self.inpainting_fn is not None and regen_config.inpainting_mask is not None:
+                try:
+                    self.inpainting_fn(regen_config.inpainting_mask)
+                except Exception as exc:  # noqa: BLE001
+                    if self.enable_logging:
+                        print(f"[VerificationDaemon] Inpainting hook failed: {exc}")
+
             if generation_fn is not None:
-                if self.enable_logging:
-                    print(f"[VerificationDaemon] Regenerating with identity_weight={new_weight:.2f}")
-                generated_embedding = generation_fn(new_weight)
+                generated_embedding, pose_keypoints = self._apply_generation_fn(
+                    generation_fn,
+                    regen_config,
+                    generated_embedding,
+                    pose_keypoints,
+                )
+
+            kinematic_result = None
+            if pose_keypoints is not None and self.enable_kinematic:
+                kinematic_result = self.verify_kinematic(pose_keypoints)
 
             identity_result = self.verify_identity(reference_embedding, generated_embedding)
-            candidates.append((identity_result.similarity_score, identity_result))
+            current_result = VerificationResult(
+                passed=(identity_result.passed and (kinematic_result is None or kinematic_result.passed)),
+                identity_result=identity_result,
+                kinematic_result=kinematic_result,
+                retry_count=retry_count,
+                max_retries=self.max_retries,
+                latent_rewind_count=latent_rewind_count,
+                final_similarity=identity_result.similarity_score,
+            )
+            candidates.append(current_result)
 
             if self.enable_logging:
-                print(f"[VerificationDaemon] Retry {retry_count} result: {'PASS' if identity_result.passed else 'FAIL'}")
+                kin_status = "N/A" if kinematic_result is None else ("PASS" if kinematic_result.passed else "FAIL")
+                print(
+                    f"[VerificationDaemon] Retry {retry_count} result: "
+                    f"identity={'PASS' if identity_result.passed else 'FAIL'}, kinematic={kin_status}"
+                )
 
-        if not identity_result.passed and candidates:
-            best_score, best_result = max(candidates, key=lambda x: x[0])
-            if self.enable_logging:
-                print(f"[VerificationDaemon] All retries exhausted. "
-                      f"Falling back to best candidate: similarity={best_score:.4f}")
-            identity_result = best_result
+        best = max(candidates, key=self._candidate_score)
+        if not current_result.passed and self.enable_logging:
+            print(
+                "[VerificationDaemon] All retries exhausted. "
+                f"Falling back to best candidate: similarity={best.final_similarity:.4f}, "
+                f"kinematic_loss={best.kinematic_result.total_loss if best.kinematic_result else 0.0:.4f}"
+            )
 
-        return VerificationResult(
-            passed=identity_result.passed,
-            identity_result=identity_result,
-            kinematic_result=kinematic_result,
-            retry_count=retry_count,
-            max_retries=self.max_retries,
-            latent_rewind_count=latent_rewind_count,
-            final_similarity=identity_result.similarity_score if identity_result else None,
-        )
+        final = best if not current_result.passed else current_result
+        final.retry_count = retry_count
+        final.max_retries = self.max_retries
+        final.latent_rewind_count = latent_rewind_count
+        return final
+
+    def _candidate_score(self, result: VerificationResult) -> tuple[int, int, float, float]:
+        """Rank candidate results for fallback selection."""
+        identity_pass = int(result.identity_result is not None and result.identity_result.passed)
+        kinematic_pass = int(result.kinematic_result is None or result.kinematic_result.passed)
+        similarity = float(result.final_similarity or -1.0)
+        kin_loss = float(result.kinematic_result.total_loss if result.kinematic_result else 0.0)
+        # Prefer passing candidates first, then higher identity similarity, then lower kinematic loss.
+        return (identity_pass + kinematic_pass, identity_pass, similarity, -kin_loss)
+
+    def _apply_generation_fn(
+        self,
+        generation_fn: Callable[..., np.ndarray | dict[str, np.ndarray] | tuple[np.ndarray, np.ndarray]],
+        regen_config: "ConstrainedRegenerationConfig",
+        current_embedding: np.ndarray,
+        current_pose: Optional[np.ndarray],
+    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Call generation function with backward-compatible signatures.
+
+        Supported return values:
+        - embedding ndarray
+        - (embedding, pose_keypoints) tuple
+        - {"embedding": ..., "pose_keypoints": ...} dict
+        """
+        try:
+            sig = inspect.signature(generation_fn)
+            num_params = len(sig.parameters)
+            param_names = [p.lower() for p in sig.parameters.keys()]
+        except (TypeError, ValueError):
+            num_params = 1
+            param_names = ["weight"]
+
+        if num_params <= 1:
+            # Backward compatible default is weight-only callbacks.
+            # If callback explicitly names a config-like parameter, pass full config.
+            use_config = bool(param_names) and param_names[0] in {
+                "config",
+                "regen_config",
+                "constraints",
+                "regeneration_config",
+            }
+            output = generation_fn(regen_config if use_config else regen_config.identity_weight)
+        else:
+            output = generation_fn(regen_config)
+
+        new_embedding = current_embedding
+        new_pose = current_pose
+
+        if isinstance(output, tuple) and len(output) >= 1:
+            new_embedding = np.asarray(output[0], dtype=np.float32)
+            if len(output) > 1 and output[1] is not None:
+                new_pose = np.asarray(output[1], dtype=np.float32)
+        elif isinstance(output, dict):
+            if "embedding" in output and output["embedding"] is not None:
+                new_embedding = np.asarray(output["embedding"], dtype=np.float32)
+            if "pose_keypoints" in output and output["pose_keypoints"] is not None:
+                new_pose = np.asarray(output["pose_keypoints"], dtype=np.float32)
+        else:
+            new_embedding = np.asarray(output, dtype=np.float32)
+
+        return new_embedding, new_pose
 
     def run_from_images(
         self,
