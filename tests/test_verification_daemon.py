@@ -825,7 +825,9 @@ class TestT42KinematicGuardrailToDaemonIntegration:
         pose = np.zeros((2, 17, 2), dtype=np.float32)
         result = daemon.verify_kinematic(pose)
         assert hasattr(result, 'bone_loss')
+        assert hasattr(result, 'rom_loss')
         assert hasattr(result, 'velocity_loss')
+        assert hasattr(result, 'topology_loss')
         assert hasattr(result, 'total_loss')
         assert hasattr(result, 'max_velocity')   
         

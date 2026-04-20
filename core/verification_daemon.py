@@ -26,7 +26,9 @@ class KinematicResult:
     """Result of kinematic constraint verification."""
     passed: bool
     bone_loss: float = 0.0
+    rom_loss: float = 0.0
     velocity_loss: float = 0.0
+    topology_loss: float = 0.0
     total_loss: float = 0.0
     v_max: float = V_MAX_DEFAULT
     max_velocity: float = 0.0
@@ -240,13 +242,16 @@ class VerificationDaemon:
 
         if self.enable_logging:
             print(f"[VerificationDaemon] Kinematic: loss={result['total_loss']:.4f}, "
-                  f"bone={result['bone_loss']:.4f}, velocity={result['velocity_loss']:.4f}, "
+                  f"bone={result['bone_loss']:.4f}, rom={result['rom_loss']:.4f}, "
+                  f"velocity={result['velocity_loss']:.4f}, topology={result['topology_loss']:.4f}, "
                   f"max_v={max_velocity:.2f}, v_max={self.v_max}, passed={passed}")
 
         return KinematicResult(
             passed=passed,
             bone_loss=result["bone_loss"],
+            rom_loss=result["rom_loss"],
             velocity_loss=result["velocity_loss"],
+            topology_loss=result["topology_loss"],
             total_loss=result["total_loss"],
             v_max=self.v_max,
             max_velocity=max_velocity,
