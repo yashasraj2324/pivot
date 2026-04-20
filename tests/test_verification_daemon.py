@@ -925,3 +925,115 @@ class TestT43EndToEndPipelineIntegration:
         assert result.max_retries == 5
         assert result.final_similarity is not None
         assert result.latent_rewind_count == 0                                       
+
+
+class TestT34ToT37UnifiedCorrectionLoop:
+    """Validate unified correction flow for rewind/inpaint/regenerate/retry/fallback."""
+
+    def test_kinematic_failure_can_recover_via_generation_fn(self):
+        """Kinematic failures should retry and recover when generation returns better pose."""
+        daemon = VerificationDaemon(
+            max_retries=2,
+            kinematic_threshold=0.01,
+            enable_logging=False,
+        )
+
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+
+        bad_embedding = np.random.randn(512).astype(np.float32)
+        bad_embedding = bad_embedding / np.linalg.norm(bad_embedding)
+
+        bad_pose = np.zeros((2, 17, 2), dtype=np.float32)
+        bad_pose[1] = 999.0  # force kinematic failure
+
+        good_pose = np.zeros((2, 17, 2), dtype=np.float32)
+        good_pose[1] = 0.1
+
+        def generation_fn(config):
+            # Return embedding + pose in the richer format supported by the daemon.
+            return {
+                "embedding": ref,
+                "pose_keypoints": good_pose,
+            }
+
+        result = daemon.run(
+            ref,
+            bad_embedding,
+            pose_keypoints=bad_pose,
+            generation_fn=generation_fn,
+        )
+
+        assert result.passed is True
+        assert result.retry_count == 1
+        assert result.identity_result is not None and result.identity_result.passed
+        assert result.kinematic_result is not None and result.kinematic_result.passed
+
+    def test_inpainting_hook_called_during_retry(self):
+        """Inpainting callback should be invoked with a generated mask on failure retries."""
+        calls = []
+
+        def inpainting_fn(mask):
+            calls.append(mask)
+            return mask
+
+        daemon = VerificationDaemon(
+            max_retries=1,
+            kinematic_threshold=0.0,
+            enable_logging=False,
+            inpainting_fn=inpainting_fn,
+        )
+
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+
+        pose = np.zeros((2, 17, 2), dtype=np.float32)
+        pose[1] = 999.0
+
+        def generation_fn(weight):
+            # Keep it bad to force retry path completion.
+            return bad
+
+        _ = daemon.run(ref, bad, pose_keypoints=pose, generation_fn=generation_fn)
+
+        assert len(calls) >= 1
+        assert calls[0].ndim == 2
+
+    def test_fallback_prefers_better_kinematic_candidate_when_identity_tied(self):
+        """Fallback should pick lower-kinematic-loss candidate when identity scores are equal."""
+        daemon = VerificationDaemon(
+            max_retries=2,
+            kinematic_threshold=0.0,  # force failures
+            enable_logging=False,
+        )
+
+        ref = np.random.randn(512).astype(np.float32)
+        ref = ref / np.linalg.norm(ref)
+        # Keep identity score constant and poor in all attempts.
+        bad = np.random.randn(512).astype(np.float32)
+        bad = bad / np.linalg.norm(bad)
+
+        pose_bad = np.zeros((2, 17, 2), dtype=np.float32)
+        pose_bad[1] = 1000.0
+        pose_less_bad = np.zeros((2, 17, 2), dtype=np.float32)
+        pose_less_bad[1] = 300.0
+        pose_better = np.zeros((2, 17, 2), dtype=np.float32)
+        pose_better[1] = 50.0
+
+        poses = [pose_less_bad, pose_better]
+
+        def generation_fn(config):
+            idx = min(config.retry_count - 1, len(poses) - 1)
+            return {
+                "embedding": bad,
+                "pose_keypoints": poses[idx],
+            }
+
+        result = daemon.run(ref, bad, pose_keypoints=pose_bad, generation_fn=generation_fn)
+
+        assert result.passed is False
+        assert result.kinematic_result is not None
+        # Best fallback should prefer the smallest available loss among failed candidates.
+        assert result.kinematic_result.total_loss <= daemon.verify_kinematic(pose_bad).total_loss
